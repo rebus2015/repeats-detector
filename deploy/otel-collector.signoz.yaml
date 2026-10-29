@@ -1,0 +1,42 @@
+# Optional collector config. Set SIGNOZ_ENDPOINT to host:4317 and use
+# this file as the collector volume; connections use TLS by default.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: rabbitmq
+          scrape_interval: 15s
+          static_configs:
+            - targets: [rabbitmq:15692]
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch: {}
+exporters:
+  otlp/signoz:
+    endpoint: ${env:SIGNOZ_ENDPOINT}
+    headers:
+      signoz-ingestion-key: ${env:SIGNOZ_INGESTION_KEY}
+    tls:
+      insecure: false
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/signoz]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/signoz]

@@ -1,0 +1,10 @@
+.env
+bin/
+reports/
+fixtures/
+*.prof
+coverage.out
+*.env
+/deploy/aws_credentials
+/backups/
+__pycache__/

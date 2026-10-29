@@ -1,0 +1,35 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: repeats
+          POSTGRES_PASSWORD: repeats
+          POSTGRES_DB: repeats
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U repeats" --health-interval 3s --health-timeout 3s --health-retries 20
+      rabbitmq:
+        image: rabbitmq:4-alpine
+        ports: ["5672:5672"]
+        options: --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://repeats:repeats@localhost:5432/repeats?sslmode=disable
+      TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go test -race -tags=integration ./... -count=1
+      - run: go build ./cmd/...
+      - run: python3 -m py_compile tools/*.py
+      - run: python3 tools/generate_corpus.py fixtures
+      - run: go run ./cmd/evaluate -manifest fixtures/manifest.json -method landmarks > /tmp/evaluation.json
+      - run: python3 -c "import json; r=json.load(open('/tmp/evaluation.json')); assert r['fp']==0 and r['fn']==0, r"

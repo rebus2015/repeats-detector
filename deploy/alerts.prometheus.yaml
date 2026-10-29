@@ -1,0 +1,35 @@
+# Reference PromQL rules; apply in Prometheus, or reproduce expressions in SigNoz.
+# Notification receivers are environment-specific and must be configured separately.
+groups:
+  - name: repeats-detector
+    rules:
+      - alert: AudioOutboxDelayed
+        expr: audio_outbox_oldest_seconds > 30
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: Result publication is delayed
+      - alert: AudioOutboxStuck
+        expr: audio_outbox_oldest_seconds > 120
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: Result outbox is stuck
+      - alert: AudioProcessingErrors
+        expr: sum(rate(audio_processed_total{status=~"error|rejected|retry_exhausted"}[5m])) / clamp_min(sum(rate(audio_processed_total[5m])), 0.001) > 0.01 and sum(increase(audio_processed_total[5m])) >= 100
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Audio processing error rate exceeds 1 percent
+      - alert: AudioDLQNotEmpty
+        expr: rabbitmq_queue_messages_ready{queue="audio.tasks.dead"} > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: Inspect and repair dead-letter tasks before replay
+      - alert: AudioMonitorFailing
+        expr: increase(audio_monitor_errors_total[1m]) > 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: Database backlog monitoring is failing

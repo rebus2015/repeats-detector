@@ -1,0 +1,59 @@
+name: repeats-detector
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: repeats
+      POSTGRES_PASSWORD: repeats
+      POSTGRES_DB: repeats
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repeats -d repeats"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  rabbitmq:
+    hostname: ${RABBITMQ_HOSTNAME:-rabbitmq}
+    image: rabbitmq:4-management-alpine
+    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672", "127.0.0.1:15692:15692"]
+    volumes: ["rabbit-data:/var/lib/rabbitmq", "./deploy/rabbitmq-enabled_plugins:/etc/rabbitmq/enabled_plugins:ro", "./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  s3mock:
+    image: adobe/s3mock:5.1.0
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: audio
+      COM_ADOBE_TESTING_S3MOCK_STORE_ROOT: /s3mockroot
+      COM_ADOBE_TESTING_S3MOCK_STORE_RETAIN_FILES_ON_EXIT: "true"
+    ports: ["127.0.0.1:9000:9090"]
+    volumes: ["s3-data:/s3mockroot"]
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: ["./deploy/otel-collector.yaml:/etc/otelcol/config.yaml:ro"]
+    ports: ["127.0.0.1:4317:4317"]
+  service:
+    build: .
+    environment:
+      DATABASE_URL: postgres://repeats:repeats@postgres:5432/repeats?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: repeats-local
+      AWS_SECRET_ACCESS_KEY: repeats-local-secret
+      S3_ENDPOINT: http://s3mock:9090
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      s3mock: {condition: service_started}
+      collector: {condition: service_started}
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  rabbit-data:
+  s3-data:

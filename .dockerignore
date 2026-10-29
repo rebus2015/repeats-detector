@@ -1,0 +1,9 @@
+.git
+.env
+bin
+reports
+fixtures
+*.env
+deploy/aws_credentials
+backups
+**/__pycache__
