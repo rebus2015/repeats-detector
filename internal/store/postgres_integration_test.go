@@ -306,6 +306,8 @@ func TestRuntimeRoleWithoutDDLAndBacklog(t *testing.T) {
 
 func TestCleanupDrainsMultipleBatches(t *testing.T) {
 	s := testStore(t)
+	s.CleanupPrintsBatchSize = 700
+	s.CleanupTasksBatchSize = 2
 	ctx := context.Background()
 	task := domain.Task{SchemaVersion: 1, TaskID: "cleanup-many", TrackID: "cleanup-many", ScopeID: "cleanup-many", S3URL: "s3://audio/test.wav"}
 	if _, e := s.Decide(ctx, task, nil, nil); e != nil {

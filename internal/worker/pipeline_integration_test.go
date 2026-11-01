@@ -84,8 +84,8 @@ func TestPipeline(t *testing.T) {
 	}
 	defer shutdown(context.Background())
 	p := &usecase.Processor{Source: &source.S3{Client: client, MaxBytes: 1000000}, Extractor: fingerprint.New(), Store: repo, MaxPrints: 100000, Metrics: metrics}
-	c := config.Config{RabbitURL: rabbit, InputQueue: schema + ".in", OutputQueue: schema + ".out", DLQueue: schema + ".dlq", Workers: 2, TaskTimeout: 20 * time.Second, PublishTimeout: 5 * time.Second, ShutdownTimeout: 5 * time.Second}
-	conn, e := dial(rabbit, 5*time.Second)
+	c := config.Config{RabbitConnectTimeout: 10 * time.Second, RabbitHeartbeat: 10 * time.Second, RabbitReconnectDelay: 2 * time.Second, TaskDeliveryLimit: 3, TaskRetryDelay: 20 * time.Millisecond, RabbitURL: rabbit, InputQueue: schema + ".in", OutputQueue: schema + ".out", DLQueue: schema + ".dlq", Workers: 2, TaskTimeout: 20 * time.Second, PublishTimeout: 5 * time.Second, ShutdownTimeout: 5 * time.Second}
+	conn, e := dial(rabbit, 5*time.Second, 10*time.Second)
 	if e != nil {
 		t.Fatal(e)
 	}

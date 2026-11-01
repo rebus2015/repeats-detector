@@ -30,6 +30,7 @@ jobs:
       - run: go test -race -tags=integration ./... -count=1
       - run: go build ./cmd/...
       - run: python3 -m py_compile tools/*.py
+      - run: python3 -m unittest discover -s tools -p "test_*.py"
       - run: python3 tools/generate_corpus.py fixtures
       - run: go run ./cmd/evaluate -manifest fixtures/manifest.json -method landmarks > /tmp/evaluation.json
       - run: python3 -c "import json; r=json.load(open('/tmp/evaluation.json')); assert r['fp']==0 and r['fn']==0, r"

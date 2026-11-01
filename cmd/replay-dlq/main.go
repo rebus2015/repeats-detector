@@ -11,6 +11,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 	"net"
 	"os"
+	"repeats-detector/internal/config"
 	"repeats-detector/internal/domain"
 	"time"
 )
@@ -23,8 +24,8 @@ func main() {
 }
 func run() error {
 	scope := flag.String("scope", "", "required exact scope_id; unrelated messages remain queued")
-	input := flag.String("input", "audio.tasks", "input queue")
-	dlq := flag.String("dlq", "audio.tasks.dead", "dead-letter queue")
+	input := flag.String("input", config.Value("INPUT_QUEUE", "audio.tasks"), "input queue")
+	dlq := flag.String("dlq", config.Value("DLQ_QUEUE", "audio.tasks.dead"), "dead-letter queue")
 	limit := flag.Int("limit", 1000, "bounded inspection count, 1..1000")
 	flag.Parse()
 	if *scope == "" || *input == *dlq || *limit < 1 || *limit > 1000 {

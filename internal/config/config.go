@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
 	"net/url"
 	"os"
@@ -18,6 +19,10 @@ type Config struct {
 	DatabaseURL, RabbitURL, InputQueue, OutputQueue, DLQueue, HTTPAddr, OTLPEndpoint, S3Endpoint          string
 	Workers, MaxBytes, MaxPrints, MaxHits, MaxPostings                                                    int
 	TaskTimeout, PublishTimeout, ShutdownTimeout, SearchWindow, Retention, CleanupInterval, TaskRetention time.Duration
+	RabbitConnectTimeout, RabbitHeartbeat, RabbitReconnectDelay, TaskRetryDelay                           time.Duration
+	OutboxPollInterval, OutboxRetryDelay, DeliveryPollInterval, StartupTimeout, CleanupTimeout            time.Duration
+	TaskDeliveryLimit, CleanupPrintsBatchSize, CleanupTasksBatchSize                                      int
+	LogLevel                                                                                              slog.Level
 	Match                                                                                                 matching.Config
 }
 
@@ -36,7 +41,17 @@ func Load() (Config, error) {
 		name string
 		dst  *int
 		def  int
-	}{{"MIN_MATCH_FRAMES", &c.Match.MinFrames, 12}, {"WORKERS", &c.Workers, 2}, {"MAX_WAV_BYTES", &c.MaxBytes, 128000000}, {"MAX_FINGERPRINTS", &c.MaxPrints, 1000000}, {"MAX_SEARCH_HITS", &c.MaxHits, 200000}, {"MAX_HASH_POSTINGS", &c.MaxPostings, 32}} {
+	}{
+		{"TASK_DELIVERY_LIMIT", &c.TaskDeliveryLimit, 5},
+		{"CLEANUP_PRINTS_BATCH_SIZE", &c.CleanupPrintsBatchSize, 50000},
+		{"CLEANUP_TASKS_BATCH_SIZE", &c.CleanupTasksBatchSize, 1000},
+		{"MIN_MATCH_FRAMES", &c.Match.MinFrames, 12},
+		{"WORKERS", &c.Workers, 2},
+		{"MAX_WAV_BYTES", &c.MaxBytes, 128000000},
+		{"MAX_FINGERPRINTS", &c.MaxPrints, 1000000},
+		{"MAX_SEARCH_HITS", &c.MaxHits, 200000},
+		{"MAX_HASH_POSTINGS", &c.MaxPostings, 32},
+	} {
 		if *v.dst, err = integer(v.name, v.def); err != nil {
 			return c, err
 		}
@@ -45,7 +60,24 @@ func Load() (Config, error) {
 		name string
 		dst  *time.Duration
 		def  string
-	}{{"TASK_TIMEOUT", &c.TaskTimeout, "2m"}, {"PUBLISH_TIMEOUT", &c.PublishTimeout, "10s"}, {"SHUTDOWN_TIMEOUT", &c.ShutdownTimeout, "30s"}, {"SEARCH_WINDOW", &c.SearchWindow, "60m"}, {"INDEX_RETENTION", &c.Retention, "90m"}, {"CLEANUP_INTERVAL", &c.CleanupInterval, "5m"}, {"TASK_RETENTION", &c.TaskRetention, "168h"}} {
+	}{
+		{"RABBITMQ_CONNECT_TIMEOUT", &c.RabbitConnectTimeout, "10s"},
+		{"RABBITMQ_HEARTBEAT", &c.RabbitHeartbeat, "10s"},
+		{"RABBITMQ_RECONNECT_DELAY", &c.RabbitReconnectDelay, "2s"},
+		{"TASK_RETRY_DELAY", &c.TaskRetryDelay, "1s"},
+		{"OUTBOX_POLL_INTERVAL", &c.OutboxPollInterval, "100ms"},
+		{"OUTBOX_RETRY_DELAY", &c.OutboxRetryDelay, "2s"},
+		{"DELIVERY_POLL_INTERVAL", &c.DeliveryPollInterval, "100ms"},
+		{"STARTUP_TIMEOUT", &c.StartupTimeout, "30s"},
+		{"CLEANUP_TIMEOUT", &c.CleanupTimeout, "30s"},
+		{"TASK_TIMEOUT", &c.TaskTimeout, "2m"},
+		{"PUBLISH_TIMEOUT", &c.PublishTimeout, "10s"},
+		{"SHUTDOWN_TIMEOUT", &c.ShutdownTimeout, "30s"},
+		{"SEARCH_WINDOW", &c.SearchWindow, "60m"},
+		{"INDEX_RETENTION", &c.Retention, "90m"},
+		{"CLEANUP_INTERVAL", &c.CleanupInterval, "5m"},
+		{"TASK_RETENTION", &c.TaskRetention, "168h"},
+	} {
 		if *v.dst, err = time.ParseDuration(env(v.name, v.def)); err != nil || *v.dst <= 0 {
 			return c, fmt.Errorf("invalid %s", v.name)
 		}
@@ -54,10 +86,20 @@ func Load() (Config, error) {
 		name string
 		dst  *float64
 		def  string
-	}{{"MIN_MATCH_SECONDS", &c.Match.MinDuration, "2"}, {"MIN_MATCH_COVERAGE", &c.Match.MinCoverage, "0.08"}, {"MAX_MATCH_GAP_SECONDS", &c.Match.MaxGap, "0.8"}} {
+	}{
+		{"MIN_MATCH_SECONDS", &c.Match.MinDuration, "2"},
+		{"MIN_MATCH_COVERAGE", &c.Match.MinCoverage, "0.08"},
+		{"MAX_MATCH_GAP_SECONDS", &c.Match.MaxGap, "0.8"},
+	} {
 		if *v.dst, err = strconv.ParseFloat(env(v.name, v.def), 64); err != nil || math.IsInf(*v.dst, 0) || math.IsNaN(*v.dst) || !(*v.dst > 0) {
 			return c, fmt.Errorf("invalid %s", v.name)
 		}
+	}
+	if err = c.LogLevel.UnmarshalText([]byte(env("LOG_LEVEL", "INFO"))); err != nil {
+		return c, fmt.Errorf("invalid LOG_LEVEL")
+	}
+	if c.TaskDeliveryLimit > 1000 || c.CleanupPrintsBatchSize > 1000000 || c.CleanupTasksBatchSize > 100000 || c.RabbitHeartbeat < time.Second || c.RabbitHeartbeat > 65535*time.Second || c.RabbitHeartbeat%time.Second != 0 {
+		return c, fmt.Errorf("operational configuration outside supported bounds")
 	}
 	if c.Match.MinCoverage > 1 || c.Retention < c.SearchWindow || c.TaskRetention < c.Retention || c.Workers > 64 || c.MaxBytes > 256000000 || c.MaxPrints > 4000000 || c.MaxHits > 1000000 || c.MaxPostings > 10000 {
 		return c, fmt.Errorf("configuration outside supported bounds")
@@ -115,3 +157,7 @@ func integer(k string, d int) (int, error) {
 	}
 	return v, nil
 }
+
+// Value returns an environment setting or its default. CLI flags can use it
+// as their initial value, so an explicit flag always takes precedence.
+func Value(key, fallback string) string { return env(key, fallback) }

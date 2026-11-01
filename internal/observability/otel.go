@@ -33,7 +33,13 @@ func (h traceHandler) WithAttrs(a []slog.Attr) slog.Handler {
 	return traceHandler{h.Handler.WithAttrs(a)}
 }
 func (h traceHandler) WithGroup(g string) slog.Handler { return traceHandler{h.Handler.WithGroup(g)} }
-func Logger() *slog.Logger                             { return slog.New(traceHandler{slog.NewJSONHandler(os.Stdout, nil)}) }
+func Logger(levels ...slog.Level) *slog.Logger {
+	level := slog.LevelInfo
+	if len(levels) > 0 {
+		level = levels[0]
+	}
+	return slog.New(traceHandler{slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})})
+}
 
 type Metrics struct {
 	OutboxPending   metric.Int64Gauge
@@ -64,9 +70,14 @@ func Setup(ctx context.Context, endpoint string) (*Metrics, func(context.Context
 			_ = te.Shutdown(ctx)
 			return nil, shutdown, e
 		}
-		res := resource.NewSchemaless(attribute.String("service.name", "repeats-detector"))
+		res, e := telemetryResource(ctx)
+		if e != nil {
+			_ = te.Shutdown(ctx)
+			_ = me.Shutdown(ctx)
+			return nil, shutdown, e
+		}
 		tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(te), sdktrace.WithResource(res))
-		mp := sdkmetric.NewMeterProvider(sdkmetric.WithResource(res), sdkmetric.WithReader(sdkmetric.NewPeriodicReader(me, sdkmetric.WithInterval(10*time.Second))))
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithResource(res), sdkmetric.WithReader(sdkmetric.NewPeriodicReader(me, metricReaderOptions()...)))
 		otel.SetTracerProvider(tp)
 		otel.SetMeterProvider(mp)
 		shutdown = func(c context.Context) error {
@@ -135,4 +146,16 @@ func (m *Metrics) Record(ctx context.Context, status string, elapsed time.Durati
 }
 func (m *Metrics) StageTime(ctx context.Context, stage string, start time.Time) {
 	m.Stage.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(attribute.String("stage", stage)))
+}
+
+func telemetryResource(ctx context.Context) (*resource.Resource, error) {
+	return resource.New(ctx, resource.WithAttributes(attribute.String("service.name", "repeats-detector")), resource.WithFromEnv())
+}
+
+func metricReaderOptions() []sdkmetric.PeriodicReaderOption {
+	// Preserve the existing 10-second default; let the SDK parse its standard ENV.
+	if os.Getenv("OTEL_METRIC_EXPORT_INTERVAL") == "" {
+		return []sdkmetric.PeriodicReaderOption{sdkmetric.WithInterval(10 * time.Second)}
+	}
+	return nil
 }

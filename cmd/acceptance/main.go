@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"repeats-detector/internal/config"
 	"repeats-detector/internal/domain"
 )
 
@@ -53,9 +54,9 @@ func main() {
 }
 func run() error {
 	manifestPath := flag.String("manifest", "", "long corpus manifest")
-	endpoint := flag.String("s3-endpoint", "http://localhost:9002", "MinIO endpoint")
+	endpoint := flag.String("s3-endpoint", config.Value("S3_ENDPOINT", "http://localhost:9002"), "MinIO endpoint")
 	bucket := flag.String("bucket", "audio", "test bucket")
-	queue := flag.String("queue", "audio.tasks", "input queue")
+	queue := flag.String("queue", config.Value("INPUT_QUEUE", "audio.tasks"), "input queue")
 	limit := flag.Int("queries", 30, "positive queries (>=5s), 0 means all")
 	concurrency := flag.Int("concurrency", 2, "maximum outstanding tasks")
 	delay := flag.Duration("query-delay", 0, "optional pacing between query batches for fault tests")

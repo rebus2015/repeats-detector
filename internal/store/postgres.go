@@ -26,9 +26,10 @@ var ErrCandidateLimit = errors.New("candidate limit exceeded; no classification 
 var schema string
 
 type Store struct {
-	Pool    *pgxpool.Pool
-	Window  time.Duration
-	MaxHits int
+	Pool                                          *pgxpool.Pool
+	Window                                        time.Duration
+	MaxHits                                       int
+	CleanupPrintsBatchSize, CleanupTasksBatchSize int
 	// MaxPostings excludes very frequent hashes within this scope and search window.
 	// Zero preserves the unfiltered legacy search, useful for controlled comparisons.
 	MaxPostings int
@@ -246,20 +247,27 @@ func (s *Store) Cleanup(ctx context.Context, indexAge, taskAge time.Duration) er
 	// Commit bounded batches and continue until drained or the caller's time
 	// budget is exhausted. A single batch per tick cannot keep up with a long-
 	// recording index; search expiry itself is independent of physical cleanup.
+	printsBatch, tasksBatch := s.CleanupPrintsBatchSize, s.CleanupTasksBatchSize
+	if printsBatch == 0 {
+		printsBatch = 50000
+	}
+	if tasksBatch == 0 {
+		tasksBatch = 1000
+	}
 	statements := []struct {
 		sql   string
 		age   time.Duration
 		batch int64
 	}{
 		{`DELETE FROM rd_prints WHERE ctid IN
-       (SELECT ctid FROM rd_prints WHERE created_at<clock_timestamp()-$1::interval LIMIT 50000)`, indexAge, 50000},
+       (SELECT ctid FROM rd_prints WHERE created_at<clock_timestamp()-$1::interval LIMIT $2)`, indexAge, int64(printsBatch)},
 		{`DELETE FROM rd_tasks WHERE (scope_id,task_id) IN
        (SELECT t.scope_id,t.task_id FROM rd_tasks t WHERE t.created_at<clock_timestamp()-$1::interval
-        AND NOT EXISTS(SELECT 1 FROM rd_outbox o WHERE o.scope_id=t.scope_id AND o.task_id=t.task_id AND o.delivered_at IS NULL) LIMIT 1000)`, taskAge, 1000},
+        AND NOT EXISTS(SELECT 1 FROM rd_outbox o WHERE o.scope_id=t.scope_id AND o.task_id=t.task_id AND o.delivered_at IS NULL) LIMIT $2)`, taskAge, int64(tasksBatch)},
 	}
 	for _, statement := range statements {
 		for {
-			tag, e := s.Pool.Exec(ctx, statement.sql, fmt.Sprintf("%f seconds", statement.age.Seconds()))
+			tag, e := s.Pool.Exec(ctx, statement.sql, fmt.Sprintf("%f seconds", statement.age.Seconds()), statement.batch)
 			if e != nil {
 				return e
 			}

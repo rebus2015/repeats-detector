@@ -15,7 +15,9 @@ python3 tools/smoke.py
 Smoke создаёт отдельную scope, загружает два WAV, публикует задачи и проверяет результаты
 через RabbitMQ management API. При просмотре результаты возвращаются в очередь.
 Можно передать --reference /path/original.wav --query /path/transformed.wav.
-Проверка использует локальные guest/guest и не предназначена для рабочего окружения.
+Адреса и credentials задаются через ENV, см. [CONFIGURATION.md](CONFIGURATION.md).
+Smoke загружает WAV без S3-подписи через `SMOKE_S3_ENDPOINT` и предназначен для S3Mock,
+а не для защищённого MinIO. Проверка не предназначена для рабочего окружения.
 
 Остановка без удаления данных: `docker compose stop`. Повторный запуск: `docker compose up -d`.
 Именованные volumes сохраняют БД, RabbitMQ и S3Mock. Команды удаления volumes не нужны для обычной остановки.

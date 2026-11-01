@@ -26,11 +26,12 @@ type Repository interface {
 	Delivered(context.Context, string) (bool, error)
 }
 type Processor struct {
-	Source    AudioSource
-	Extractor Fingerprinter
-	Store     Repository
-	MaxPrints int
-	Metrics   *observability.Metrics
+	Source               AudioSource
+	Extractor            Fingerprinter
+	Store                Repository
+	MaxPrints            int
+	Metrics              *observability.Metrics
+	DeliveryPollInterval time.Duration
 }
 
 func (p *Processor) Process(ctx context.Context, t domain.Task) (domain.Result, error) {
@@ -82,7 +83,11 @@ func (p *Processor) Process(ctx context.Context, t domain.Task) (domain.Result, 
 	return r, e
 }
 func (p *Processor) WaitDelivered(ctx context.Context, id string) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	interval := p.DeliveryPollInterval
+	if interval == 0 {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		yes, e := p.Store.Delivered(ctx, id)

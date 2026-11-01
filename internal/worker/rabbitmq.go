@@ -23,8 +23,8 @@ import (
 	"repeats-detector/internal/usecase"
 )
 
-func dial(url string, timeout time.Duration) (*amqp.Connection, error) {
-	return amqp.DialConfig(url, amqp.Config{Heartbeat: 10 * time.Second, Dial: func(network, addr string) (net.Conn, error) {
+func dial(url string, timeout, heartbeat time.Duration) (*amqp.Connection, error) {
+	return amqp.DialConfig(url, amqp.Config{Heartbeat: heartbeat, Dial: func(network, addr string) (net.Conn, error) {
 		c, e := net.DialTimeout(network, addr, timeout)
 		if e != nil {
 			return nil, e
@@ -73,7 +73,7 @@ func (p *Publisher) Publish(ctx context.Context, id string, body []byte, headers
 	deadline, _ := ctx.Deadline()
 	if p.conn == nil || p.conn.IsClosed() {
 		p.reset()
-		p.conn, err = amqp.DialConfig(p.config.RabbitURL, amqp.Config{Heartbeat: 10 * time.Second, Dial: func(network, addr string) (net.Conn, error) {
+		p.conn, err = amqp.DialConfig(p.config.RabbitURL, amqp.Config{Heartbeat: p.config.RabbitHeartbeat, Dial: func(network, addr string) (net.Conn, error) {
 			var e error
 			p.raw, e = (&net.Dialer{}).DialContext(ctx, network, addr)
 			if e == nil {
@@ -168,14 +168,14 @@ func (w *Consumer) Run(ctx context.Context) error {
 		if e := w.session(ctx); e != nil && ctx.Err() == nil {
 			w.Log.ErrorContext(ctx, "RabbitMQ session ended", "error", e)
 		}
-		if !pause(ctx, 2*time.Second) {
+		if !pause(ctx, w.Config.RabbitReconnectDelay) {
 			break
 		}
 	}
 	return nil
 }
 func (w *Consumer) session(ctx context.Context) error {
-	conn, e := dial(w.Config.RabbitURL, 10*time.Second)
+	conn, e := dial(w.Config.RabbitURL, w.Config.RabbitConnectTimeout, w.Config.RabbitHeartbeat)
 	if e != nil {
 		return e
 	}
@@ -191,7 +191,7 @@ func (w *Consumer) session(ctx context.Context) error {
 	if _, e = ch.QueueDeclare(w.Config.OutputQueue, true, false, false, false, nil); e != nil {
 		return e
 	}
-	args := amqp.Table{"x-dead-letter-exchange": "", "x-dead-letter-routing-key": w.Config.DLQueue, "x-queue-type": "quorum", "x-delivery-limit": int32(5)}
+	args := amqp.Table{"x-dead-letter-exchange": "", "x-dead-letter-routing-key": w.Config.DLQueue, "x-queue-type": "quorum", "x-delivery-limit": int32(w.Config.TaskDeliveryLimit)}
 	if _, e = ch.QueueDeclare(w.Config.InputQueue, true, false, false, false, args); e != nil {
 		return e
 	}
@@ -289,11 +289,11 @@ func (w *Consumer) handle(parent context.Context, d amqp.Delivery) {
 		span.RecordError(e)
 		span.SetStatus(codes.Error, "processing failed")
 		permanent := errors.Is(e, domain.ErrInvalid) || errors.Is(e, domain.ErrConflict)
-		exhausted := deliveryAttempts(d.Headers) >= 5
+		exhausted := deliveryAttempts(d.Headers) >= int64(w.Config.TaskDeliveryLimit)
 		w.Log.ErrorContext(ctx, "audio processing failed", "task_id", t.TaskID, "permanent", permanent, "error", e)
 		if !permanent && !exhausted {
 			w.Metrics.Retries.Add(ctx, 1)
-			pause(ctx, time.Second)
+			pause(ctx, w.Config.TaskRetryDelay)
 		} else {
 			status = "rejected"
 			if exhausted {

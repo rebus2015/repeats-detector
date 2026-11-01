@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -34,10 +35,10 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	log := observability.Logger()
+	log := observability.Logger(c.LogLevel)
 	intake, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	startup, cancel := context.WithTimeout(intake, 30*time.Second)
+	startup, cancel := context.WithTimeout(intake, c.StartupTimeout)
 	defer cancel()
 	metrics, shutdown, e := observability.Setup(startup, c.OTLPEndpoint)
 	if e != nil {
@@ -50,11 +51,11 @@ func run() error {
 			log.Error("telemetry shutdown failed", "error", err)
 		}
 	}()
-	pc, e := pgxpool.ParseConfig(c.DatabaseURL)
+	pc, e := databasePoolConfig(c)
 	if e != nil {
 		return fmt.Errorf("database configuration invalid")
 	}
-	pc.MaxConns = int32(c.Workers + 6)
+
 	pool, e := pgxpool.NewWithConfig(startup, pc)
 	if e != nil {
 		return e
@@ -63,7 +64,7 @@ func run() error {
 	if e = pool.Ping(startup); e != nil {
 		return fmt.Errorf("database unavailable: %w", e)
 	}
-	repo := &store.Store{Pool: pool, Window: c.SearchWindow, MaxHits: c.MaxHits, MaxPostings: c.MaxPostings, Match: c.Match}
+	repo := &store.Store{Pool: pool, Window: c.SearchWindow, MaxHits: c.MaxHits, MaxPostings: c.MaxPostings, Match: c.Match, CleanupPrintsBatchSize: c.CleanupPrintsBatchSize, CleanupTasksBatchSize: c.CleanupTasksBatchSize}
 	if c.AutoMigrate {
 		e = repo.Migrate(startup)
 	} else {
@@ -84,7 +85,7 @@ func run() error {
 	})
 	extractor := fingerprint.New()
 	extractor.MaxPrints = c.MaxPrints
-	processor := &usecase.Processor{Source: &source.S3{Client: client, MaxBytes: c.MaxBytes}, Extractor: extractor, Store: repo, MaxPrints: c.MaxPrints, Metrics: metrics}
+	processor := &usecase.Processor{Source: &source.S3{Client: client, MaxBytes: c.MaxBytes}, Extractor: extractor, Store: repo, MaxPrints: c.MaxPrints, Metrics: metrics, DeliveryPollInterval: c.DeliveryPollInterval}
 	background, halt := context.WithCancel(context.Background())
 	defer halt()
 	publisher := worker.NewPublisher(c)
@@ -99,9 +100,9 @@ func run() error {
 			if err != nil {
 				log.Error("outbox publication failed", "error", err)
 			}
-			delay := 100 * time.Millisecond
+			delay := c.OutboxPollInterval
 			if err != nil {
-				delay = 2 * time.Second
+				delay = c.OutboxRetryDelay
 			}
 			if worked && err == nil {
 				continue
@@ -124,7 +125,7 @@ func run() error {
 			case <-background.Done():
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(background, 30*time.Second)
+				ctx, cancel := context.WithTimeout(background, c.CleanupTimeout)
 				err := repo.Cleanup(ctx, c.Retention, c.TaskRetention)
 				cancel()
 				if err != nil {
@@ -191,4 +192,20 @@ func run() error {
 		return err
 	}
 	return e
+}
+
+func databasePoolConfig(c config.Config) (*pgxpool.Config, error) {
+	pc, err := pgxpool.ParseConfig(c.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the historical default while respecting explicit DSN pool sizing.
+	u, err := url.Parse(c.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if !u.Query().Has("pool_max_conns") {
+		pc.MaxConns = int32(c.Workers + 6)
+	}
+	return pc, nil
 }
