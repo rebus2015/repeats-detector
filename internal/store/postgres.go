@@ -285,6 +285,7 @@ func (s *Store) candidates(ctx context.Context, tx pgx.Tx, t domain.Task, hashes
 		return nil, err
 	}
 	hits := make([]domain.Hit, 0)
+	excluded := false
 	for rows.Next() {
 		var h domain.Hit
 		if err = rows.Scan(&h.Hash, &h.QueryFrame, &h.OriginalFrame, &h.TrackID, &h.CreatedAt); err != nil {
@@ -292,14 +293,8 @@ func (s *Store) candidates(ctx context.Context, tx pgx.Tx, t domain.Task, hashes
 			return nil, err
 		}
 		if h.QueryFrame < 0 {
-			rows.Close()
-			// Some real speech (and large sets of repeated copies) consists
-			// mostly of common hashes. Retry with all hashes, under the same
-			// hard candidate bound, rather than silently classifying as unique.
-			span.SetAttributes(attribute.Bool("audio.frequent_hash_fallback", true))
-			unfiltered := *s
-			unfiltered.MaxPostings = 0
-			return unfiltered.candidates(ctx, tx, t, hashes, frames, now)
+			excluded = true
+			continue
 		}
 		hits = append(hits, h)
 	}
@@ -310,6 +305,20 @@ func (s *Store) candidates(ctx context.Context, tx pgx.Tx, t domain.Task, hashes
 	}
 	if len(hits) > s.MaxHits {
 		return nil, ErrCandidateLimit
+	}
+	if excluded {
+		candidate, err := matching.BestContext(ctx, hits, s.Match)
+		if err != nil {
+			return nil, err
+		}
+		if candidate == nil {
+			// Even a minority of common hashes can contain the entire repeated
+			// segment. Retry all evidence together under the same hard hit limit.
+			span.SetAttributes(attribute.Bool("audio.frequent_hash_fallback", true))
+			unfiltered := *s
+			unfiltered.MaxPostings = 0
+			return unfiltered.candidates(ctx, tx, t, hashes, frames, now)
+		}
 	}
 	span.SetAttributes(attribute.Int("audio.candidate_hits", len(hits)))
 	return hits, nil
@@ -349,16 +358,12 @@ func (s *Store) candidateSQL(t domain.Task, hashes []int64, frames []int32, now 
             LIMIT $8
           ) p
         )
-        , discriminative AS MATERIALIZED (
-          SELECT (SELECT count(DISTINCT hash) FROM postings WHERE frequency >= $8)*2
-                 <= (SELECT count(DISTINCT hash) FROM query_prints) AS enough
-        )
         SELECT p.hash,q.frame,p.frame,p.track_id,p.created_at
         FROM query_prints q JOIN postings p ON p.hash=q.hash
-        WHERE p.frequency < $8 AND (SELECT enough FROM discriminative)
+        WHERE p.frequency < $8
         UNION ALL
         SELECT 0::bigint,-1::integer,-1::integer,''::text,$6::timestamptz
-        WHERE NOT (SELECT enough FROM discriminative)
+        WHERE EXISTS (SELECT 1 FROM postings WHERE frequency >= $8)
         LIMIT $7`
 		args = append(args, s.MaxPostings+1)
 	}

@@ -83,17 +83,40 @@ func BestContext(ctx context.Context, hits []domain.Hit, c Config) (*domain.Matc
 			continue
 		}
 		sort.Ints(frames)
-		start := 0
-		for end := 0; end < len(frames); end++ {
-			if end+1 < len(frames) && float64(frames[end+1]-frames[end])*fingerprint.FrameSeconds <= c.MaxGap {
+		// Eligible starts have enough frames and duration for the current end.
+		// Prefix minima of i-coverage*frame[i] let us find the earliest start
+		// satisfying coverage in O(log n), including intervals inside a chain.
+		starts := make([]int, 0, len(frames))
+		next := 0
+		for end := range frames {
+			if end%1024 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			if end > 0 && float64(frames[end]-frames[end-1])*fingerprint.FrameSeconds > c.MaxGap {
+				starts = starts[:0]
+				next = end
+			}
+			value := func(i int) float64 { return float64(i) - c.MinCoverage*float64(frames[i]) }
+			for next <= end && end-next+1 >= c.MinFrames && float64(frames[end]-frames[next]+1)*fingerprint.FrameSeconds >= c.MinDuration {
+				if frames[next]+key.delta >= 0 && (len(starts) == 0 || value(next) < value(starts[len(starts)-1])) {
+					starts = append(starts, next)
+				}
+				next++
+			}
+			threshold := float64(end+1) - c.MinCoverage*float64(frames[end]+1)
+			pos := sort.Search(len(starts), func(i int) bool { return value(starts[i]) <= threshold+1e-9 })
+			if pos == len(starts) {
 				continue
 			}
+			start := starts[pos]
 			n := end - start + 1
 			span := frames[end] - frames[start] + 1
 			duration := float64(span) * fingerprint.FrameSeconds
 			coverage := float64(n) / float64(span)
 			original := frames[start] + key.delta
-			if n >= c.MinFrames && duration >= c.MinDuration && coverage >= c.MinCoverage && original >= 0 {
+			if coverage >= c.MinCoverage {
 				m := &domain.Match{OriginalTrackID: key.track, QueryStartSec: float64(frames[start]) * fingerprint.FrameSeconds, OriginalStartSec: float64(original) * fingerprint.FrameSeconds, MatchedDurationSec: duration, Score: math.Min(1, coverage), Evidence: n}
 				age := ages[m.OriginalTrackID]
 				if best == nil || m.Evidence > best.Evidence || (m.Evidence == best.Evidence && (age.Before(bestAge) || (age.Equal(bestAge) && (m.OriginalTrackID < best.OriginalTrackID || (m.OriginalTrackID == best.OriginalTrackID && m.OriginalStartSec < best.OriginalStartSec))))) {
@@ -101,7 +124,6 @@ func BestContext(ctx context.Context, hits []domain.Hit, c Config) (*domain.Matc
 					bestAge = age
 				}
 			}
-			start = end + 1
 		}
 	}
 	return best, nil

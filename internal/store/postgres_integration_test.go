@@ -344,3 +344,57 @@ func TestFrequentHashFallbackRetainsCopy(t *testing.T) {
 		t.Fatalf("copy lost: %+v %v", r, e)
 	}
 }
+
+func TestFrequentHashFallbackRetainsPartialCopy(t *testing.T) {
+	s := testStore(t)
+	s.MaxPostings = 32
+	ctx := context.Background()
+	task := func(id string) domain.Task {
+		return domain.Task{SchemaVersion: 1, TaskID: id, TrackID: id, ScopeID: "partial-common", S3URL: "s3://audio/" + id}
+	}
+	// Two frequent hashes alone confirm a 2.128-second interval. Additional
+	// distinct hashes make the reference informative without helping this query.
+	var reference []domain.Print
+	for f := 0; f <= 132; f += 4 {
+		reference = append(reference, domain.Print{Hash: 1, Frame: f}, domain.Print{Hash: 2, Frame: f})
+	}
+	for i := 0; i < 12; i++ {
+		reference = append(reference, domain.Print{Hash: int64(100 + i), Frame: i * 12})
+	}
+	if r, err := s.Decide(ctx, task("reference"), reference, nil); err != nil || r.Status != "unique" {
+		t.Fatalf("reference: %+v %v", r, err)
+	}
+	var query []domain.Print
+	for f := 0; f <= 132; f += 12 {
+		query = append(query, domain.Print{Hash: 1, Frame: f}, domain.Print{Hash: 2, Frame: f})
+	}
+	// The majority of query hashes are new and absent from the index. They
+	// must not suppress fallback for the common hashes in the repeated part.
+	for i := 0; i < 20; i++ {
+		query = append(query, domain.Print{Hash: int64(1000 + i), Frame: 160 + i*10})
+	}
+	for _, tc := range []struct {
+		name     string
+		maxHits  int
+		overflow bool
+	}{
+		{"overflow", 10, true},
+		{"bounded-copy", 200000, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.MaxHits = tc.maxHits
+			r, err := s.Decide(ctx, task(tc.name), query, nil)
+			if tc.overflow {
+				if !errors.Is(err, ErrCandidateLimit) {
+					t.Fatalf("expected candidate limit, got %+v %v", r, err)
+				}
+				existing, err := s.Existing(ctx, task(tc.name))
+				if err != nil || existing != nil {
+					t.Fatalf("overflow committed a classification: %+v %v", existing, err)
+				}
+			} else if err != nil || r.Status != "duplicate" || r.Match == nil || r.Match.OriginalTrackID != "reference" {
+				t.Fatalf("partial copy lost: %+v %v", r, err)
+			}
+		})
+	}
+}

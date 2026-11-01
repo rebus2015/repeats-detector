@@ -51,6 +51,37 @@ const PairSpan = 64
 // Частотный радиус в проверке ниже также равен 3, но задан отдельно в FFT-бинах.
 const radius = 3
 
+// Параметры алгоритма v2. Изменение правил формирования отпечатков требует
+// новой Version; эти значения не являются настройками рабочего окружения.
+const (
+	frequencyRadius      = 3 // частотное окружение пика в FFT-бинах
+	firstSpectrumBin     = 4 // пропускаем DC и самые низкие частоты
+	firstPeakBin         = firstSpectrumBin + frequencyRadius
+	peakBinEnd           = Size/2 - frequencyRadius - 1 // верхняя граница не включается; сохраняет запас v2
+	minMeanSquareEnergy  = 1e-7
+	minPeakPower         = 1e-8
+	relativePeakPower    = 0.04
+	maxPeaksPerFrame     = 3
+	minPairFrames        = 4
+	maxPairsPerPeak      = 6
+	pairTimeQuantization = 2
+	targetFrequencyShift = 10
+	anchorFrequencyShift = 20
+	defaultBinWidth      = 2
+	maxBinWidth          = 16
+)
+
+// Ограничения ресурсов и частота проверки отмены не меняют формат отпечатков.
+const (
+	defaultMaxPrints       = 1000000
+	spectrumCancelInterval = 64
+	pairingCancelInterval  = 128
+	initialPeakCapacity    = 16 // начальная ёмкость, не ограничение числа пиков
+)
+
+type powerSpectrum [Size / 2]float64
+type spectrumRing [2*radius + 1]powerSpectrum
+
 // peak — локальный максимум спектральной мощности. bin обозначает частотный
 // индекс FFT, frame — временной индекс окна, power — ненормированную мощность.
 type peak struct {
@@ -60,7 +91,7 @@ type peak struct {
 
 // Extractor хранит окно Ханна и ограничения извлечения.
 // Можно использовать один экземпляр параллельно, если после создания его поля
-// не изменяются: все рабочие массивы выделяются локально в Extract.
+// не изменяются: рабочие массивы создаются отдельно для каждого вызова Extract.
 type Extractor struct {
 	// window сглаживает края окна, уменьшая спектральную утечку при FFT.
 	window [Size]float64
@@ -75,7 +106,7 @@ type Extractor struct {
 // New создаёт рабочую конфигурацию v2: частотное квантование по 2 бина
 // и защитный лимит в миллион отпечатков. Лимит можно задать до начала обработки.
 func New() *Extractor {
-	e := &Extractor{BinWidth: 2, MaxPrints: 1000000}
+	e := &Extractor{BinWidth: defaultBinWidth, MaxPrints: defaultMaxPrints}
 	// Симметричное окно Ханна имеет нулевые значения на обоих краях кадра.
 	// Знаменатель Size-1 важен: другая форма окна может изменить отбор пиков.
 	for i := range e.window {
@@ -129,108 +160,109 @@ func fft(a []complex128) {
 // пустой результат без ошибки — итоговую информативность оценивает use case.
 // При отмене контекста или превышении лимита частичный результат не возвращается.
 func (e *Extractor) Extract(ctx context.Context, pcm audio.PCM) ([]domain.Print, error) {
-	if e.BinWidth < 1 || e.BinWidth > 16 || e.MaxPrints < 1 {
+	if e.BinWidth < 1 || e.BinWidth > maxBinWidth || e.MaxPrints < 1 {
 		return nil, fmt.Errorf("invalid extractor configuration")
 	}
 	if pcm.Len() < Size {
 		return nil, nil
 	}
-	// Число полных перекрывающихся окон; дополнение нулями не используется.
+	peaks, err := e.extractPeaks(ctx, pcm)
+	if err != nil {
+		return nil, err
+	}
+	return e.pairPeaks(ctx, peaks)
+}
+
+// extractPeaks хранит только окружение, необходимое для локальных максимумов.
+// Первые и последние radius кадров не имеют полного окружения и не дают опорных пиков.
+func (e *Extractor) extractPeaks(ctx context.Context, pcm audio.PCM) ([]peak, error) {
 	count := 1 + (pcm.Len()-Size)/Hop
-	// Кольцо хранит только 7 спектров. Когда пришёл кадр frame, можно решить,
-	// является ли пик кадра frame-radius максимумом в полном окружении.
-	// Память спектров постоянна; списки peaks и out растут с длительностью записи.
-	var ring [2*radius + 1][Size / 2]float64
-	var spectrum [Size]complex128
+	var ring spectrumRing
+	var scratch [Size]complex128
 	peaks := make([]peak, 0, count)
 	for frame := 0; frame < count; frame++ {
-		// Проверяем отмену раз в 64 окна, чтобы не делать проверку на каждый отсчёт.
-		if frame%64 == 0 {
+		if frame%spectrumCancelInterval == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		// Энергию измеряем на исходных нормированных отсчётах, а FFT выполняем
-		// после умножения на окно Ханна. Это два разных представления одного кадра.
-		energy := 0.0
-		for i := 0; i < Size; i++ {
-			v := pcm.Sample(frame*Hop + i)
-			energy += v * v
-			spectrum[i] = complex(v*e.window[i], 0)
-		}
-		row := &ring[frame%len(ring)]
-		// Очищаем переиспользуемый слот и для тихих кадров: иначе в нём остался
-		// бы спектр старого кадра, способный породить ложный временной максимум.
-		clear(row[:])
-		// 1e-7 — эмпирический нижний порог средней квадратичной амплитуды.
-		// Он отсекает почти нулевой сигнал; это не детектор наличия речи (VAD).
-		if energy/Size >= 1e-7 {
-			fft(spectrum[:])
-			// Для вещественного сигнала достаточно положительной половины спектра.
-			// DC и первые низкочастотные бины пропускаем. |X|² даёт мощность без
-			// вычисления квадратного корня; абсолютный масштаб зависит от Size и окна.
-			for i := 4; i < Size/2; i++ {
-				row[i] = real(spectrum[i])*real(spectrum[i]) + imag(spectrum[i])*imag(spectrum[i])
-			}
-		}
-		// До заполнения кольца полного окружения ещё нет. Первые и последние
-		// radius кадров поэтому не становятся опорными пиками.
+		e.computeSpectrum(pcm, frame, &scratch, &ring[frame%len(ring)])
 		if frame < 2*radius {
 			continue
 		}
-		center := frame - radius
-		middle := &ring[center%len(ring)]
-		maximum := 0.0
-		for _, v := range middle {
-			maximum = math.Max(maximum, v)
+		peaks = append(peaks, ring.framePeaks(frame-radius)...)
+	}
+	return peaks, nil
+}
+
+// computeSpectrum проверяет энергию исходного сигнала и вычисляет мощность FFT
+// после применения окна Ханна. Очистка слота даже для тишины исключает старые пики.
+func (e *Extractor) computeSpectrum(pcm audio.PCM, frame int, scratch *[Size]complex128, out *powerSpectrum) {
+	energy := 0.0
+	for i := 0; i < Size; i++ {
+		v := pcm.Sample(frame*Hop + i)
+		energy += v * v
+		scratch[i] = complex(v*e.window[i], 0)
+	}
+	clear(out[:])
+	if energy/Size < minMeanSquareEnergy {
+		return
+	}
+	fft(scratch[:])
+	for i := firstSpectrumBin; i < Size/2; i++ {
+		out[i] = real(scratch[i])*real(scratch[i]) + imag(scratch[i])*imag(scratch[i])
+	}
+}
+
+// framePeaks выбирает сильнейшие локальные максимумы, сохраняя порядок v2
+// при равных мощностях. Относительный и абсолютный пороги отсекают слабые пики.
+func (ring *spectrumRing) framePeaks(center int) []peak {
+	middle := &ring[center%len(ring)]
+	maximum := 0.0
+	for _, v := range middle {
+		maximum = math.Max(maximum, v)
+	}
+	candidates := make([]peak, 0, initialPeakCapacity)
+	for bin := firstPeakBin; bin < peakBinEnd; bin++ {
+		value := middle[bin]
+		if value <= maximum*relativePeakPower || value < minPeakPower {
+			continue
 		}
-		// 16 — начальная ёмкость буфера кандидатов, не ограничение их числа.
-		candidates := make([]peak, 0, 16)
-		// Запас в 3 частотных бина позволяет читать соседей без выхода за границы.
-		// Нижняя граница 7 также оставляет соседей выше пропущенных бинов 0..3.
-		for bin := 7; bin < Size/2-4; bin++ {
-			value := middle[bin]
-			// Относительный порог: мощность должна превышать 4% максимума кадра
-			// (примерно -14 дБ по мощности). Дополнительный порог 1e-8 отсекает
-			// очень слабые значения. Это эвристики, а не физически калиброванные уровни.
-			if value <= maximum*0.04 || value < 1e-8 {
+		if ring.isLocalPeak(center, bin) {
+			candidates = append(candidates, peak{bin: bin, frame: center, power: value})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].power > candidates[j].power })
+	if len(candidates) > maxPeaksPerFrame {
+		candidates = candidates[:maxPeaksPerFrame]
+	}
+	return candidates
+}
+
+// isLocalPeak на плато предпочитает ранний кадр, затем меньшую частоту.
+// Требует полного временного окружения и запаса по границам частотных бинов.
+func (ring *spectrumRing) isLocalPeak(center, bin int) bool {
+	value := ring[center%len(ring)][bin]
+	for dt := -radius; dt <= radius; dt++ {
+		for df := -frequencyRadius; df <= frequencyRadius; df++ {
+			if dt == 0 && df == 0 {
 				continue
 			}
-			// Проверяем двумерное окружение: время ±3 кадра, частота ±3 бина.
-			// Частотный максимум одного кадра без временной проверки создавал
-			// слишком много одинаковых признаков у разных речевых записей.
-			local := true
-			for dt := -radius; dt <= radius && local; dt++ {
-				for df := -3; df <= 3; df++ {
-					if dt == 0 && df == 0 {
-						continue
-					}
-					other := ring[(center+dt)%len(ring)][bin+df]
-					// На плато равных значений выбираем более раннюю позицию, затем
-					// меньшую частоту, чтобы не создавать несколько равнозначных пиков.
-					if other > value || (other == value && (dt < 0 || (dt == 0 && df < 0))) {
-						local = false
-						break
-					}
-				}
-			}
-			if local {
-				candidates = append(candidates, peak{bin: bin, frame: center, power: value})
+			other := ring[(center+dt)%len(ring)][bin+df]
+			if other > value || (other == value && (dt < 0 || (dt == 0 && df < 0))) {
+				return false
 			}
 		}
-		// Оставляем до трёх сильнейших локальных пиков кадра. Больше пиков
-		// увеличивает число пар, размер индекса и вероятность случайных совпадений.
-		sort.Slice(candidates, func(i, j int) bool { return candidates[i].power > candidates[j].power })
-		if len(candidates) > 3 {
-			candidates = candidates[:3]
-		}
-		peaks = append(peaks, candidates...)
 	}
-	// peaks упорядочен по времени; внутри кадра пики идут по убыванию мощности.
-	// Для каждого опорного пика ищем ближайшие допустимые будущие цели.
-	out := make([]domain.Print, 0, len(peaks)*6)
+	return true
+}
+
+// pairPeaks выбирает первые допустимые будущие цели в порядке времени,
+// а не самые сильные. При отмене или превышении лимита частичный результат отбрасывается.
+func (e *Extractor) pairPeaks(ctx context.Context, peaks []peak) ([]domain.Print, error) {
+	out := make([]domain.Print, 0, len(peaks)*maxPairsPerPeak)
 	for i, a := range peaks {
-		if i%128 == 0 {
+		if i%pairingCancelInterval == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
@@ -239,36 +271,27 @@ func (e *Extractor) Extract(ctx context.Context, pcm audio.PCM) ([]domain.Print,
 		for j := i + 1; j < len(peaks); j++ {
 			b := peaks[j]
 			delta := b.frame - a.frame
-			// Минимальный разрыв — 4 кадра (64 мс). Пики одного кадра и слишком
-			// близких кадров не дают нужного временного контекста для этой эвристики.
-			if delta < 4 {
+			if delta < minPairFrames {
 				continue
 			}
-			// Дальнейшие пики ещё позже, поэтому можно закончить поиск для a.
 			if delta > PairSpan {
 				break
 			}
-			// Это компактная упаковка признаков, а не криптографический хеш:
-			// [частотная группа a << 20 | частотная группа b << 10 | delta/2].
-			// Для частотных индексов здесь хватает 10 бит, для delta/2 — 6 бит;
-			// поля не перекрываются при текущих размерах FFT и PairSpan.
-			// При BinWidth=2 частотная сетка равна 31.25 Гц, временная — 32 мс.
-			// Квантование повышает шанс совпадения после небольшого искажения,
-			// но разные пары могут получить один хеш — нужна последующая проверка.
-			hash := int64((a.bin/e.BinWidth)<<20 | (b.bin/e.BinWidth)<<10 | (delta / 2))
 			if len(out) >= e.MaxPrints {
 				return nil, fmt.Errorf("%w: fingerprint limit exceeded", domain.ErrInvalid)
 			}
-			// Абсолютное время a не включено в хеш: оно нужно отдельно для
-			// расчёта сдвига между запросом и найденной записью при matching.
-			out = append(out, domain.Print{Hash: hash, Frame: a.frame})
+			out = append(out, domain.Print{Hash: e.pairHash(a.bin, b.bin, delta), Frame: a.frame})
 			paired++
-			// Берём первые шесть допустимых целей, а не шесть самых сильных
-			// во всём интервале. Ограничение сдерживает число отпечатков.
-			if paired == 6 {
+			if paired == maxPairsPerPeak {
 				break
 			}
 		}
 	}
 	return out, nil
+}
+
+// pairHash упаковывает две частотные группы и временной интервал в непересекающиеся
+// поля: [anchor << 20 | target << 10 | delta/2]. Абсолютная позиция хранится отдельно.
+func (e *Extractor) pairHash(anchorBin, targetBin, delta int) int64 {
+	return int64((anchorBin/e.BinWidth)<<anchorFrequencyShift | (targetBin/e.BinWidth)<<targetFrequencyShift | (delta / pairTimeQuantization))
 }
