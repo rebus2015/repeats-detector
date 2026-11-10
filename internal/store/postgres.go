@@ -12,8 +12,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 
 	"repeats-detector/internal/domain"
 	"repeats-detector/internal/fingerprint"
@@ -25,17 +23,15 @@ var ErrCandidateLimit = errors.New("candidate limit exceeded; no classification 
 //go:embed schema.sql
 var schema string
 
+// Store хранит настройки поиска и записывает результаты в PostgreSQL.
 type Store struct {
-	Pool                                          *pgxpool.Pool
-	Window                                        time.Duration
-	MaxHits                                       int
-	CleanupPrintsBatchSize, CleanupTasksBatchSize int
-	// MaxPostings excludes very frequent hashes within this scope and search window.
-	// Zero preserves the unfiltered legacy search, useful for controlled comparisons.
+	Pool        *pgxpool.Pool
+	MaxHits     int
 	MaxPostings int
 	Match       matching.Config
 }
 
+// Migrate создаёт таблицы под блокировкой, общей для всех запусков утилиты.
 func (s *Store) Migrate(ctx context.Context) error {
 	tx, e := s.Pool.Begin(ctx)
 	if e != nil {
@@ -50,27 +46,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	return tx.Commit(ctx)
 }
-func (s *Store) Existing(ctx context.Context, t domain.Task) (*domain.Result, error) {
-	var raw []byte
-	var digest string
-	e := s.Pool.QueryRow(ctx, "SELECT digest,result FROM rd_tasks WHERE scope_id=$1 AND task_id=$2", t.ScopeID, t.TaskID).Scan(&digest, &raw)
-	if e == pgx.ErrNoRows {
-		return nil, nil
-	}
-	if e != nil {
-		return nil, e
-	}
-	if digest != t.Digest() {
-		return nil, domain.ErrConflict
-	}
-	var r domain.Result
-	e = json.Unmarshal(raw, &r)
-	return &r, e
-}
 
-// Decide uses READ COMMITTED and acquires a scope lock before searching. The next
-// statement sees the previous lock holder's commit, including its fingerprints.
-func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print, headers map[string]string) (domain.Result, error) {
+// Decide записывает классификацию и отпечатки в одной транзакции.
+// Блокировка сериализует обработку внутри области поиска. В режиме READ COMMITTED
+// запросы после её получения видят результаты предыдущей транзакции.
+func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print) (domain.Result, error) {
 	r := domain.Result{}
 	tx, e := s.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if e != nil {
@@ -84,7 +64,7 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 	var digest string
 	e = tx.QueryRow(ctx, "SELECT digest,result FROM rd_tasks WHERE scope_id=$1 AND task_id=$2", t.ScopeID, t.TaskID).Scan(&digest, &raw)
 	if e == nil {
-		if digest != t.Digest() {
+		if digest != t.TaskID {
 			return r, domain.ErrConflict
 		}
 		e = json.Unmarshal(raw, &r)
@@ -93,12 +73,12 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 	if e != pgx.ErrNoRows {
 		return r, e
 	}
-	// Use database time after waiting for the scope lock, avoiding process clock skew.
+	// Берём время PostgreSQL после получения блокировки, чтобы не зависеть от часов процесса.
 	var now time.Time
 	if e = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); e != nil {
 		return r, e
 	}
-	r = domain.Result{SchemaVersion: 1, EventID: t.EventID(), TaskID: t.TaskID, TrackID: t.TrackID, ScopeID: t.ScopeID, Status: "insufficient_audio", AlgorithmVersion: fingerprint.Version, IndexedAt: now}
+	r = domain.Result{SchemaVersion: 1, File: t.File, TaskID: t.TaskID, TrackID: t.TaskID, ScopeID: t.ScopeID, Status: "insufficient_audio", AlgorithmVersion: fingerprint.Version, IndexedAt: now}
 	hashes := make([]int64, len(prints))
 	frames := make([]int32, len(prints))
 	for i, p := range prints {
@@ -107,8 +87,8 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 	}
 	if len(prints) > 0 {
 		r.Status = "unique"
-		// Bound search memory independently of file duration. Overlapping windows
-		// retain matches crossing a boundary. Full-file prints are still indexed.
+		// Перекрывающиеся окна ограничивают объём поиска за один запрос
+		// и позволяют проверять совпадения на стыках. В индекс попадает весь файл.
 		ordered := append([]domain.Print(nil), prints...)
 		sort.Slice(ordered, func(i, j int) bool { return ordered[i].Frame < ordered[j].Frame })
 		width := int(math.Ceil(math.Max(10, 2*s.Match.MinDuration+s.Match.MaxGap) / fingerprint.FrameSeconds))
@@ -124,17 +104,12 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 			minWidth := int(math.Ceil((2*s.Match.MinDuration + s.Match.MaxGap) / fingerprint.FrameSeconds))
 			if errors.Is(err, ErrCandidateLimit) && width > minWidth {
 				width = max(minWidth, width/2)
-				continue // Retry this position with a smaller, still overlapping window.
+				continue // Повторяем поиск с той же позиции и меньшим окном.
 			}
 			if err != nil {
 				return r, err
 			}
-			verifyCtx, span := otel.Tracer("repeats-detector").Start(ctx, "Match_Verify")
-			candidate, err := matching.BestContext(verifyCtx, hits, s.Match)
-			if err != nil {
-				span.RecordError(err)
-			}
-			span.End()
+			candidate, err := matching.BestContext(ctx, hits, s.Match)
 			if err != nil {
 				return r, err
 			}
@@ -158,36 +133,33 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 			r.Match = nil
 		}
 	}
-	raw, e = json.Marshal(r)
-	if e != nil {
-		return r, e
-	}
-	if _, e = tx.Exec(ctx, "INSERT INTO rd_tasks(scope_id,task_id,digest,result,created_at) VALUES($1,$2,$3,$4,$5)", t.ScopeID, t.TaskID, t.Digest(), raw, now); e != nil {
-		return r, e
-	}
-	// Index partial repeats too, preserving new audio for future queries.
-	if r.Status != "insufficient_audio" {
-		indexCtx, indexSpan := otel.Tracer("repeats-detector").Start(ctx, "Index_Write")
-		_, e = tx.Exec(indexCtx, `INSERT INTO rd_prints(scope_id,task_id,track_id,version,hash,frame,created_at)
-   SELECT $1,$2,$3,$4,x.hash,x.frame,$5 FROM unnest($6::bigint[],$7::integer[]) AS x(hash,frame)
-   ON CONFLICT DO NOTHING`, t.ScopeID, t.TaskID, t.TrackID, fingerprint.Version, now, hashes, frames)
-		if e != nil {
-			indexSpan.RecordError(e)
-		}
-		indexSpan.End()
+	if r.Match != nil {
+		e = tx.QueryRow(ctx, "SELECT result->>'file' FROM rd_tasks WHERE scope_id=$1 AND task_id=$2",
+			t.ScopeID, r.Match.OriginalTrackID).Scan(&r.Match.OriginalFile)
 		if e != nil {
 			return r, e
 		}
 	}
-	hdr, e := json.Marshal(headers)
+	raw, e = json.Marshal(r)
 	if e != nil {
 		return r, e
 	}
-	if _, e = tx.Exec(ctx, "INSERT INTO rd_outbox(event_id,scope_id,task_id,body,headers,created_at) VALUES($1,$2,$3,$4,$5,$6)", r.EventID, t.ScopeID, t.TaskID, raw, hdr, now); e != nil {
+	if _, e = tx.Exec(ctx, "INSERT INTO rd_tasks(scope_id,task_id,digest,result,created_at) VALUES($1,$2,$3,$4,$5)", t.ScopeID, t.TaskID, t.TaskID, raw, now); e != nil {
 		return r, e
+	}
+	// Индексируем и частичные повторы, чтобы новые фрагменты участвовали в следующих поисках.
+	if r.Status != "insufficient_audio" {
+		_, e = tx.Exec(ctx, `INSERT INTO rd_prints(scope_id,task_id,track_id,version,hash,frame,created_at)
+   SELECT $1,$2,$3,$4,x.hash,x.frame,$5 FROM unnest($6::bigint[],$7::integer[]) AS x(hash,frame)
+   ON CONFLICT DO NOTHING`, t.ScopeID, t.TaskID, t.TaskID, fingerprint.Version, now, hashes, frames)
+		if e != nil {
+			return r, e
+		}
 	}
 	return r, tx.Commit(ctx)
 }
+
+// informative проверяет разнообразие отпечатков и длительность сигнала между ними.
 func informative(p []domain.Print, c matching.Config) bool {
 	frames := map[int]bool{}
 	hashes := map[int64]bool{}
@@ -204,89 +176,10 @@ func informative(p []domain.Print, c matching.Config) bool {
 	}
 	return len(frames) >= c.MinFrames && len(hashes) >= c.MinFrames && float64(hi-lo)*fingerprint.FrameSeconds >= c.MinDuration
 }
-func (s *Store) Delivered(ctx context.Context, id string) (bool, error) {
-	var yes bool
-	e := s.Pool.QueryRow(ctx, "SELECT delivered_at IS NOT NULL FROM rd_outbox WHERE event_id=$1", id).Scan(&yes)
-	return yes, e
-}
-
-type PublishFunc func(context.Context, string, []byte, map[string]string) error
-
-// A row lock prevents concurrent outbox publishers from handling the same event.
-// A crash after broker confirmation still permits re-publication with the same ID.
-func (s *Store) PublishOne(ctx context.Context, publish PublishFunc) (bool, error) {
-	tx, e := s.Pool.Begin(ctx)
-	if e != nil {
-		return false, e
-	}
-	defer tx.Rollback(ctx)
-	var id string
-	var body, hdr []byte
-	e = tx.QueryRow(ctx, "SELECT event_id,body,headers FROM rd_outbox WHERE delivered_at IS NULL ORDER BY created_at,event_id FOR UPDATE SKIP LOCKED LIMIT 1").Scan(&id, &body, &hdr)
-	if e == pgx.ErrNoRows {
-		return false, nil
-	}
-	if e != nil {
-		return false, e
-	}
-	headers := map[string]string{}
-	if e = json.Unmarshal(hdr, &headers); e != nil {
-		return false, e
-	}
-	if e = publish(ctx, id, body, headers); e != nil {
-		return false, e
-	}
-	if _, e = tx.Exec(ctx, "UPDATE rd_outbox SET delivered_at=clock_timestamp() WHERE event_id=$1", id); e != nil {
-		return false, e
-	}
-	return true, tx.Commit(ctx)
-}
-func (s *Store) Cleanup(ctx context.Context, indexAge, taskAge time.Duration) error {
-	ctx, span := otel.Tracer("repeats-detector").Start(ctx, "Retention_Cleanup")
-	defer span.End()
-	// Commit bounded batches and continue until drained or the caller's time
-	// budget is exhausted. A single batch per tick cannot keep up with a long-
-	// recording index; search expiry itself is independent of physical cleanup.
-	printsBatch, tasksBatch := s.CleanupPrintsBatchSize, s.CleanupTasksBatchSize
-	if printsBatch == 0 {
-		printsBatch = 50000
-	}
-	if tasksBatch == 0 {
-		tasksBatch = 1000
-	}
-	statements := []struct {
-		sql   string
-		age   time.Duration
-		batch int64
-	}{
-		{`DELETE FROM rd_prints WHERE ctid IN
-       (SELECT ctid FROM rd_prints WHERE created_at<clock_timestamp()-$1::interval LIMIT $2)`, indexAge, int64(printsBatch)},
-		{`DELETE FROM rd_tasks WHERE (scope_id,task_id) IN
-       (SELECT t.scope_id,t.task_id FROM rd_tasks t WHERE t.created_at<clock_timestamp()-$1::interval
-        AND NOT EXISTS(SELECT 1 FROM rd_outbox o WHERE o.scope_id=t.scope_id AND o.task_id=t.task_id AND o.delivered_at IS NULL) LIMIT $2)`, taskAge, int64(tasksBatch)},
-	}
-	for _, statement := range statements {
-		for {
-			tag, e := s.Pool.Exec(ctx, statement.sql, fmt.Sprintf("%f seconds", statement.age.Seconds()), statement.batch)
-			if e != nil {
-				return e
-			}
-			if tag.RowsAffected() < statement.batch {
-				break
-			}
-		}
-	}
-	return nil
-}
-
 func (s *Store) candidates(ctx context.Context, tx pgx.Tx, t domain.Task, hashes []int64, frames []int32, now time.Time) ([]domain.Hit, error) {
-	ctx, span := otel.Tracer("repeats-detector").Start(ctx, "Candidate_Search")
-	defer span.End()
 	query, args := s.candidateSQL(t, hashes, frames, now)
-	// The scope and array lengths vary by orders of magnitude. A cached generic
-	// plan can select an expiry-index scan for every hash after a few executions.
-	// Use an unnamed extended-protocol statement so PostgreSQL plans this batch
-	// with its actual scope, time bounds and query-array cardinality.
+	// Без кэшированного общего плана PostgreSQL строит план для текущей
+	// области поиска, временной границы и размера массива отпечатков.
 	queryArgs := append([]any{pgx.QueryExecModeExec}, args...)
 	rows, err := tx.Query(ctx, query, queryArgs...)
 	if err != nil {
@@ -300,6 +193,7 @@ func (s *Store) candidates(ctx context.Context, tx pgx.Tx, t domain.Task, hashes
 			rows.Close()
 			return nil, err
 		}
+		// Служебная строка отмечает, что запрос отфильтровал частые хеши.
 		if h.QueryFrame < 0 {
 			excluded = true
 			continue
@@ -320,38 +214,25 @@ func (s *Store) candidates(ctx context.Context, tx pgx.Tx, t domain.Task, hashes
 			return nil, err
 		}
 		if candidate == nil {
-			// Even a minority of common hashes can contain the entire repeated
-			// segment. Retry all evidence together under the same hard hit limit.
-			span.SetAttributes(attribute.Bool("audio.frequent_hash_fallback", true))
+			// Частые хеши могут описывать весь повтор. Повторяем поиск с ними,
+			// сохраняя общий лимит на число совпадений.
 			unfiltered := *s
 			unfiltered.MaxPostings = 0
 			return unfiltered.candidates(ctx, tx, t, hashes, frames, now)
 		}
 	}
-	span.SetAttributes(attribute.Int("audio.candidate_hits", len(hits)))
 	return hits, nil
 }
 
-// Backlog is cheap even when delivered history is large: the pending partial
-// index serves both count and oldest age. Age is computed by database time.
-func (s *Store) Backlog(ctx context.Context) (int64, float64, error) {
-	var count int64
-	var age float64
-	e := s.Pool.QueryRow(ctx, `SELECT count(*),COALESCE(EXTRACT(EPOCH FROM clock_timestamp()-min(created_at)),0)
- FROM rd_outbox WHERE delivered_at IS NULL`).Scan(&count, &age)
-	return count, age, e
-}
-
 func (s *Store) candidateSQL(t domain.Task, hashes []int64, frames []int32, now time.Time) (string, []any) {
-	// Materialize at most MaxPostings+1 rows per distinct query hash. A hash
-	// exceeding the bound is excluded entirely, never arbitrarily truncated.
-	// The cap depends on the active scope/window, not on unrelated tenants.
+	// Для каждого хеша достаточно прочитать MaxPostings+1 строк, чтобы определить,
+	// превышен ли лимит в текущей области. Слишком частый хеш исключается целиком.
 	query := `SELECT p.hash,q.frame,p.frame,p.track_id,p.created_at
        FROM unnest($1::bigint[],$2::integer[]) AS q(hash,frame)
        JOIN rd_prints p ON p.hash=q.hash
-       WHERE p.scope_id=$3 AND p.version=$4 AND p.created_at >= $5 AND p.created_at <= $6
-       ORDER BY p.track_id,q.frame,p.frame LIMIT $7`
-	args := []any{hashes, frames, t.ScopeID, fingerprint.Version, now.Add(-s.Window), now, s.MaxHits + 1}
+       WHERE p.scope_id=$3 AND p.version=$4 AND p.created_at <= $5
+       ORDER BY p.track_id,q.frame,p.frame LIMIT $6`
+	args := []any{hashes, frames, t.ScopeID, fingerprint.Version, now, s.MaxHits + 1}
 	if s.MaxPostings > 0 {
 		query = `WITH query_prints AS MATERIALIZED (
           SELECT DISTINCT hash,frame FROM unnest($1::bigint[],$2::integer[]) AS q(hash,frame)
@@ -361,48 +242,24 @@ func (s *Store) candidateSQL(t domain.Task, hashes []int64, frames []int32, now 
           FROM (SELECT DISTINCT hash FROM query_prints) h
           CROSS JOIN LATERAL (
             SELECT frame,track_id,created_at FROM rd_prints
-            WHERE scope_id=$3 AND version=$4 AND hash=h.hash AND created_at >= $5 AND created_at <= $6
+            WHERE scope_id=$3 AND version=$4 AND hash=h.hash AND created_at <= $5
             ORDER BY created_at
-            LIMIT $8
+            LIMIT $7
           ) p
         )
         SELECT p.hash,q.frame,p.frame,p.track_id,p.created_at
         FROM query_prints q JOIN postings p ON p.hash=q.hash
-        WHERE p.frequency < $8
+        WHERE p.frequency < $7
         UNION ALL
-        SELECT 0::bigint,-1::integer,-1::integer,''::text,$6::timestamptz
-        WHERE EXISTS (SELECT 1 FROM postings WHERE frequency >= $8)
-        LIMIT $7`
+        SELECT 0::bigint,-1::integer,-1::integer,''::text,$5::timestamptz
+        WHERE EXISTS (SELECT 1 FROM postings WHERE frequency >= $7)
+        LIMIT $6`
 		args = append(args, s.MaxPostings+1)
 	}
 	return query, args
 }
 
-// ExplainCandidates executes a bounded read-only diagnostic query. Operators
-// should use a test scope: ANALYZE actually runs candidate retrieval.
-func (s *Store) ExplainCandidates(ctx context.Context, scope string, prints []domain.Print) ([]string, error) {
-	hashes, frames := make([]int64, len(prints)), make([]int32, len(prints))
-	for i, p := range prints {
-		hashes[i], frames[i] = p.Hash, int32(p.Frame)
-	}
-	q, args := s.candidateSQL(domain.Task{ScopeID: scope}, hashes, frames, time.Now())
-	rows, e := s.Pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF) "+q, args...)
-	if e != nil {
-		return nil, e
-	}
-	defer rows.Close()
-	lines := []string{}
-	for rows.Next() {
-		var line string
-		if e = rows.Scan(&line); e != nil {
-			return nil, e
-		}
-		lines = append(lines, line)
-	}
-	return lines, rows.Err()
-}
-
-// CheckSchema allows the runtime role to start without DDL permissions.
+// CheckSchema проверяет версию таблиц при запуске с отключённой миграцией.
 func (s *Store) CheckSchema(ctx context.Context) error {
 	var version int
 	if e := s.Pool.QueryRow(ctx, "SELECT max(version) FROM rd_schema").Scan(&version); e != nil {

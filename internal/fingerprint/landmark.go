@@ -6,8 +6,7 @@
 // от сохранности пиков; совпадение одного хеша само по себе не доказывает повтор.
 // Последовательность и временное выравнивание проверяет пакет matching.
 //
-// Параметры v2 — экспериментальный компромисс, проверенный на небольшом корпусе
-// речи. Полной оптимизации параметров FFT, отбора пиков и построения пар не было.
+// Для телефонного аудио FFT работает на исходной частоте 8 кГц.
 package fingerprint
 
 import (
@@ -23,20 +22,19 @@ import (
 
 // Version отделяет несовместимые отпечатки в поисковом индексе.
 // При изменении правил извлечения или квантования рабочему алгоритму нужна
-// новая версия. BinWidth=4 используется только как отдельный вариант оценки;
-// вызывающий код не должен смешивать его отпечатки с рабочим индексом v2.
-const Version = "landmark-v2-temporal-fft1024-hop256"
+// новая версия.
+const Version = "landmark-v3-alaw-8khz-fft512-hop128"
 
-// Size — число отсчётов в окне FFT: 1024 / 16000 = 64 мс.
-// Частотный шаг равен 16000 / 1024 = 15.625 Гц. Степень двойки позволяет
+// Size — число отсчётов в окне FFT: 512 / 8000 = 64 мс.
+// Частотный шаг равен 8000 / 512 = 15.625 Гц. Степень двойки позволяет
 // использовать radix-2 FFT; большее окно улучшает частотное разрешение,
 // но ухудшает локализацию быстрых изменений речи.
-const Size = 1024
+const Size = 512
 
-// Hop — шаг анализа в отсчётах: 256 / 16000 = 16 мс, перекрытие окон 75%.
+// Hop — шаг анализа в отсчётах: 128 / 8000 = 16 мс, перекрытие окон 75%.
 // Плотная сетка уменьшает чувствительность к позиции обрезки, однако произвольный
 // сдвиг аудио всё равно меняет содержимое окон: идентичность хешей не гарантируется.
-const Hop = 256
+const Hop = 128
 
 // FrameSeconds переводит индекс кадра в секунды относительно начала PCM.
 const FrameSeconds = float64(Hop) / audio.SampleRate
@@ -51,13 +49,13 @@ const PairSpan = 64
 // Частотный радиус в проверке ниже также равен 3, но задан отдельно в FFT-бинах.
 const radius = 3
 
-// Параметры алгоритма v2. Изменение правил формирования отпечатков требует
+// Параметры алгоритма. Изменение правил формирования отпечатков требует
 // новой Version; эти значения не являются настройками рабочего окружения.
 const (
 	frequencyRadius      = 3 // частотное окружение пика в FFT-бинах
 	firstSpectrumBin     = 4 // пропускаем DC и самые низкие частоты
 	firstPeakBin         = firstSpectrumBin + frequencyRadius
-	peakBinEnd           = Size/2 - frequencyRadius - 1 // верхняя граница не включается; сохраняет запас v2
+	peakBinEnd           = Size/2 - frequencyRadius - 1 // верхняя граница не включается; оставляет запас у частоты Найквиста
 	minMeanSquareEnergy  = 1e-7
 	minPeakPower         = 1e-8
 	relativePeakPower    = 0.04
@@ -103,7 +101,7 @@ type Extractor struct {
 	BinWidth, MaxPrints int
 }
 
-// New создаёт рабочую конфигурацию v2: частотное квантование по 2 бина
+// New создаёт рабочую конфигурацию: частотное квантование по 2 бина
 // и защитный лимит в миллион отпечатков. Лимит можно задать до начала обработки.
 func New() *Extractor {
 	e := &Extractor{BinWidth: defaultBinWidth, MaxPrints: defaultMaxPrints}
@@ -151,14 +149,15 @@ func fft(a []complex128) {
 }
 
 // Extract возвращает хеши пар пиков и позиции их опорных кадров.
-// PCM должен быть предварительно проверен: 16 кГц, mono, signed 16-bit little-endian.
+// На вход подаются декодированные линейные отсчёты монофонического аудио 8 кГц.
 // Метод читает исходный буфер и не изменяет его; вызывающий код должен сохранять
 // буфер неизменным до возврата. Результат уже не ссылается на исходное аудио.
 //
 // Неполное последнее окно и крайние кадры без полного временного окружения
 // не анализируются как опорные пики. Для короткого или тихого аудио возможен
-// пустой результат без ошибки — итоговую информативность оценивает use case.
-// При отмене контекста или превышении лимита частичный результат не возвращается.
+// пустой результат без ошибки — итоговую информативность оценивает хранилище при классификации.
+// Результат ограничен первыми MaxPrints отпечатками. При отмене контекста
+// метод возвращает ошибку.
 func (e *Extractor) Extract(ctx context.Context, pcm audio.PCM) ([]domain.Print, error) {
 	if e.BinWidth < 1 || e.BinWidth > maxBinWidth || e.MaxPrints < 1 {
 		return nil, fmt.Errorf("invalid extractor configuration")
@@ -214,8 +213,8 @@ func (e *Extractor) computeSpectrum(pcm audio.PCM, frame int, scratch *[Size]com
 	}
 }
 
-// framePeaks выбирает сильнейшие локальные максимумы, сохраняя порядок v2
-// при равных мощностях. Относительный и абсолютный пороги отсекают слабые пики.
+// framePeaks выбирает сильнейшие локальные максимумы.
+// Относительный и абсолютный пороги отсекают слабые пики.
 func (ring *spectrumRing) framePeaks(center int) []peak {
 	middle := &ring[center%len(ring)]
 	maximum := 0.0
@@ -258,9 +257,9 @@ func (ring *spectrumRing) isLocalPeak(center, bin int) bool {
 }
 
 // pairPeaks выбирает первые допустимые будущие цели в порядке времени,
-// а не самые сильные. При отмене или превышении лимита частичный результат отбрасывается.
+// а не самые сильные. После заполнения лимита формирование пар останавливается.
 func (e *Extractor) pairPeaks(ctx context.Context, peaks []peak) ([]domain.Print, error) {
-	out := make([]domain.Print, 0, len(peaks)*maxPairsPerPeak)
+	out := make([]domain.Print, 0, min(e.MaxPrints, len(peaks)*maxPairsPerPeak))
 	for i, a := range peaks {
 		if i%pairingCancelInterval == 0 {
 			if err := ctx.Err(); err != nil {
@@ -277,10 +276,10 @@ func (e *Extractor) pairPeaks(ctx context.Context, peaks []peak) ([]domain.Print
 			if delta > PairSpan {
 				break
 			}
-			if len(out) >= e.MaxPrints {
-				return nil, fmt.Errorf("%w: fingerprint limit exceeded", domain.ErrInvalid)
-			}
 			out = append(out, domain.Print{Hash: e.pairHash(a.bin, b.bin, delta), Frame: a.frame})
+			if len(out) == e.MaxPrints {
+				return out, nil
+			}
 			paired++
 			if paired == maxPairsPerPeak {
 				break

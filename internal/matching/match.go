@@ -10,6 +10,8 @@ import (
 	"repeats-detector/internal/fingerprint"
 )
 
+// Config задаёт пороги проверки совпадения. Длительность и разрыв
+// выражены в секундах, покрытие является долей кадров, допуск измеряется в кадрах.
 type Config struct {
 	MinDuration float64
 	MinFrames   int
@@ -32,11 +34,13 @@ type alignment struct {
 	delta int
 }
 
-// Best requires independent query frames and temporal coverage, not raw hash votes.
+// Best ищет совпадение по подтверждённым кадрам и их плотности на интервале.
 func Best(hits []domain.Hit, c Config) *domain.Match {
 	m, _ := BestContext(context.Background(), hits, c)
 	return m
 }
+
+// BestContext ищет лучшее совпадение с поддержкой отмены через контекст.
 func BestContext(ctx context.Context, hits []domain.Hit, c Config) (*domain.Match, error) {
 	groups := make(map[alignment]map[int]frameEvidence)
 	ages := make(map[string]time.Time)
@@ -49,12 +53,14 @@ func BestContext(ctx context.Context, hits []domain.Hit, c Config) (*domain.Matc
 		if age, ok := ages[h.TrackID]; !ok || h.CreatedAt.Before(age) {
 			ages[h.TrackID] = h.CreatedAt
 		}
+		// Кадры повторяющегося фрагмента дают примерно одинаковый сдвиг.
 		delta := h.OriginalFrame - h.QueryFrame
 		for d := delta - c.Tolerance; d <= delta+c.Tolerance; d++ {
 			key := alignment{h.TrackID, d}
 			if groups[key] == nil {
 				groups[key] = make(map[int]frameEvidence)
 			}
+			// Кадр подтверждается, когда в группе совпали хотя бы два разных хеша.
 			e, exists := groups[key][h.QueryFrame]
 			if !exists {
 				e.hash = h.Hash
@@ -83,9 +89,9 @@ func BestContext(ctx context.Context, hits []domain.Hit, c Config) (*domain.Matc
 			continue
 		}
 		sort.Ints(frames)
-		// Eligible starts have enough frames and duration for the current end.
-		// Prefix minima of i-coverage*frame[i] let us find the earliest start
-		// satisfying coverage in O(log n), including intervals inside a chain.
+		// Для текущего конца рассматриваем начала с достаточным числом кадров и длительностью.
+		// Храним только новые минимумы выражения i − MinCoverage × frames[i].
+		// По ним двоичный поиск находит первое начало с нужной плотностью кадров.
 		starts := make([]int, 0, len(frames))
 		next := 0
 		for end := range frames {

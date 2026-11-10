@@ -1,9 +1,6 @@
 .git
+.github
+.idea
 .env
-bin
-reports
-fixtures
 *.env
-deploy/aws_credentials
-backups
-**/__pycache__
+bin
