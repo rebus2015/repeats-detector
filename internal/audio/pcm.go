@@ -1,15 +1,13 @@
 package audio
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"repeats-detector/internal/domain"
 )
 
-// SampleRate задаёт частоту отсчётов входного монофонического A-law.
-const SampleRate = 8000
-
-// PCM хранит декодированные знаковые линейные отсчёты частоты SampleRate.
+// PCM хранит декодированные знаковые линейные отсчёты.
 type PCM []int16
 
 func (p PCM) Len() int { return len(p) }
@@ -37,6 +35,18 @@ func DecodeALaw(data []byte) (PCM, error) {
 			value = -value
 		}
 		pcm[i] = value
+	}
+	return pcm, nil
+}
+
+// DecodeS16LE читает знаковые 16-битные линейные отсчёты без заголовка.
+func DecodeS16LE(data []byte) (PCM, error) {
+	if len(data) == 0 || len(data)%2 != 0 {
+		return nil, fmt.Errorf("%w: S16LE requires a non-empty sequence of complete 16-bit samples", domain.ErrInvalid)
+	}
+	pcm := make(PCM, len(data)/2)
+	for i := range pcm {
+		pcm[i] = int16(binary.LittleEndian.Uint16(data[2*i:]))
 	}
 	return pcm, nil
 }

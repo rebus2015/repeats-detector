@@ -6,7 +6,7 @@
 // от сохранности пиков; совпадение одного хеша само по себе не доказывает повтор.
 // Последовательность и временное выравнивание проверяет пакет matching.
 //
-// Для телефонного аудио FFT работает на исходной частоте 8 кГц.
+// FFT работает на исходной частоте выбранного пресета.
 package fingerprint
 
 import (
@@ -20,24 +20,10 @@ import (
 	"repeats-detector/internal/domain"
 )
 
-// Version отделяет несовместимые отпечатки в поисковом индексе.
-// При изменении правил извлечения или квантования рабочему алгоритму нужна
-// новая версия.
-const Version = "landmark-v3-alaw-8khz-fft512-hop128"
+// Оба пресета используют окно 64 мс и шаг 16 мс.
+const FrameSeconds = 0.016
 
-// Size — число отсчётов в окне FFT: 512 / 8000 = 64 мс.
-// Частотный шаг равен 8000 / 512 = 15.625 Гц. Степень двойки позволяет
-// использовать radix-2 FFT; большее окно улучшает частотное разрешение,
-// но ухудшает локализацию быстрых изменений речи.
-const Size = 512
-
-// Hop — шаг анализа в отсчётах: 128 / 8000 = 16 мс, перекрытие окон 75%.
-// Плотная сетка уменьшает чувствительность к позиции обрезки, однако произвольный
-// сдвиг аудио всё равно меняет содержимое окон: идентичность хешей не гарантируется.
-const Hop = 128
-
-// FrameSeconds переводит индекс кадра в секунды относительно начала PCM.
-const FrameSeconds = float64(Hop) / audio.SampleRate
+const maxFFTSize = 1024
 
 // PairSpan ограничивает расстояние между пиками одной пары: 64 кадра = 1.024 с.
 // Слишком далёкие пары увеличивают стоимость поиска целей и зависимость от
@@ -50,12 +36,11 @@ const PairSpan = 64
 const radius = 3
 
 // Параметры алгоритма. Изменение правил формирования отпечатков требует
-// новой Version; эти значения не являются настройками рабочего окружения.
+// новой версии; эти значения не являются настройками рабочего окружения.
 const (
 	frequencyRadius      = 3 // частотное окружение пика в FFT-бинах
 	firstSpectrumBin     = 4 // пропускаем DC и самые низкие частоты
 	firstPeakBin         = firstSpectrumBin + frequencyRadius
-	peakBinEnd           = Size/2 - frequencyRadius - 1 // верхняя граница не включается; оставляет запас у частоты Найквиста
 	minMeanSquareEnergy  = 1e-7
 	minPeakPower         = 1e-8
 	relativePeakPower    = 0.04
@@ -77,7 +62,7 @@ const (
 	initialPeakCapacity    = 16 // начальная ёмкость, не ограничение числа пиков
 )
 
-type powerSpectrum [Size / 2]float64
+type powerSpectrum [maxFFTSize / 2]float64
 type spectrumRing [2*radius + 1]powerSpectrum
 
 // peak — локальный максимум спектральной мощности. bin обозначает частотный
@@ -92,7 +77,8 @@ type peak struct {
 // не изменяются: рабочие массивы создаются отдельно для каждого вызова Extract.
 type Extractor struct {
 	// window сглаживает края окна, уменьшая спектральную утечку при FFT.
-	window [Size]float64
+	window  []float64
+	version string
 
 	// BinWidth — ширина частотной группы в FFT-бинах. Значение 2 даёт шаг
 	// 31.25 Гц; квантование повышает терпимость к небольшим изменениям спектра,
@@ -101,20 +87,36 @@ type Extractor struct {
 	BinWidth, MaxPrints int
 }
 
-// New создаёт рабочую конфигурацию: частотное квантование по 2 бина
-// и защитный лимит в миллион отпечатков. Лимит можно задать до начала обработки.
-func New() *Extractor {
-	e := &Extractor{BinWidth: defaultBinWidth, MaxPrints: defaultMaxPrints}
+// New8kHz создаёт извлекатель для A-law 8 кГц.
+func New8kHz() *Extractor {
+	return newExtractor(512, "landmark-v3-alaw-8khz-fft512-hop128")
+}
+
+// New16kHz создаёт извлекатель для линейного PCM 16 кГц.
+func New16kHz() *Extractor {
+	return newExtractor(1024, "landmark-v3-s16le-16khz-fft1024-hop256")
+}
+
+// Version отделяет несовместимые отпечатки в поисковом индексе.
+func (e *Extractor) Version() string { return e.version }
+
+func newExtractor(size int, version string) *Extractor {
+	e := &Extractor{
+		window:    make([]float64, size),
+		version:   version,
+		BinWidth:  defaultBinWidth,
+		MaxPrints: defaultMaxPrints,
+	}
 	// Симметричное окно Ханна имеет нулевые значения на обоих краях кадра.
-	// Знаменатель Size-1 важен: другая форма окна может изменить отбор пиков.
+	// Знаменатель size-1 важен: другая форма окна может изменить отбор пиков.
 	for i := range e.window {
-		e.window[i] = 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(Size-1))
+		e.window[i] = 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(size-1))
 	}
 	return e
 }
 
 // fft выполняет прямое ненормированное radix-2 преобразование на месте.
-// Длина a должна быть степенью двойки; Extract всегда передаёт Size элементов.
+// Длина a должна быть степенью двойки; Extract передаёт окно выбранного пресета.
 // После преобразования элементы содержат комплексные частотные коэффициенты.
 func fft(a []complex128) {
 	n := len(a)
@@ -149,7 +151,7 @@ func fft(a []complex128) {
 }
 
 // Extract возвращает хеши пар пиков и позиции их опорных кадров.
-// На вход подаются декодированные линейные отсчёты монофонического аудио 8 кГц.
+// На вход подаются декодированные линейные отсчёты монофонического аудио выбранного пресета.
 // Метод читает исходный буфер и не изменяет его; вызывающий код должен сохранять
 // буфер неизменным до возврата. Результат уже не ссылается на исходное аудио.
 //
@@ -162,7 +164,7 @@ func (e *Extractor) Extract(ctx context.Context, pcm audio.PCM) ([]domain.Print,
 	if e.BinWidth < 1 || e.BinWidth > maxBinWidth || e.MaxPrints < 1 {
 		return nil, fmt.Errorf("invalid extractor configuration")
 	}
-	if pcm.Len() < Size {
+	if pcm.Len() < len(e.window) {
 		return nil, nil
 	}
 	peaks, err := e.extractPeaks(ctx, pcm)
@@ -175,9 +177,11 @@ func (e *Extractor) Extract(ctx context.Context, pcm audio.PCM) ([]domain.Print,
 // extractPeaks хранит только окружение, необходимое для локальных максимумов.
 // Первые и последние radius кадров не имеют полного окружения и не дают опорных пиков.
 func (e *Extractor) extractPeaks(ctx context.Context, pcm audio.PCM) ([]peak, error) {
-	count := 1 + (pcm.Len()-Size)/Hop
+	size := len(e.window)
+	hop := size / 4
+	count := 1 + (pcm.Len()-size)/hop
 	var ring spectrumRing
-	var scratch [Size]complex128
+	scratch := make([]complex128, size)
 	peaks := make([]peak, 0, count)
 	for frame := 0; frame < count; frame++ {
 		if frame%spectrumCancelInterval == 0 {
@@ -185,44 +189,44 @@ func (e *Extractor) extractPeaks(ctx context.Context, pcm audio.PCM) ([]peak, er
 				return nil, err
 			}
 		}
-		e.computeSpectrum(pcm, frame, &scratch, &ring[frame%len(ring)])
+		e.computeSpectrum(pcm, frame*hop, scratch, &ring[frame%len(ring)])
 		if frame < 2*radius {
 			continue
 		}
-		peaks = append(peaks, ring.framePeaks(frame-radius)...)
+		peaks = append(peaks, ring.framePeaks(frame-radius, size/2)...)
 	}
 	return peaks, nil
 }
 
 // computeSpectrum проверяет энергию исходного сигнала и вычисляет мощность FFT
 // после применения окна Ханна. Очистка слота даже для тишины исключает старые пики.
-func (e *Extractor) computeSpectrum(pcm audio.PCM, frame int, scratch *[Size]complex128, out *powerSpectrum) {
+func (e *Extractor) computeSpectrum(pcm audio.PCM, offset int, scratch []complex128, out *powerSpectrum) {
 	energy := 0.0
-	for i := 0; i < Size; i++ {
-		v := pcm.Sample(frame*Hop + i)
+	for i := 0; i < len(scratch); i++ {
+		v := pcm.Sample(offset + i)
 		energy += v * v
 		scratch[i] = complex(v*e.window[i], 0)
 	}
 	clear(out[:])
-	if energy/Size < minMeanSquareEnergy {
+	if energy/float64(len(scratch)) < minMeanSquareEnergy {
 		return
 	}
-	fft(scratch[:])
-	for i := firstSpectrumBin; i < Size/2; i++ {
+	fft(scratch)
+	for i := firstSpectrumBin; i < len(scratch)/2; i++ {
 		out[i] = real(scratch[i])*real(scratch[i]) + imag(scratch[i])*imag(scratch[i])
 	}
 }
 
 // framePeaks выбирает сильнейшие локальные максимумы.
 // Относительный и абсолютный пороги отсекают слабые пики.
-func (ring *spectrumRing) framePeaks(center int) []peak {
+func (ring *spectrumRing) framePeaks(center, bins int) []peak {
 	middle := &ring[center%len(ring)]
 	maximum := 0.0
-	for _, v := range middle {
+	for _, v := range middle[:bins] {
 		maximum = math.Max(maximum, v)
 	}
 	candidates := make([]peak, 0, initialPeakCapacity)
-	for bin := firstPeakBin; bin < peakBinEnd; bin++ {
+	for bin := firstPeakBin; bin < bins-frequencyRadius-1; bin++ {
 		value := middle[bin]
 		if value <= maximum*relativePeakPower || value < minPeakPower {
 			continue

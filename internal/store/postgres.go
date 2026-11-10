@@ -25,10 +25,11 @@ var schema string
 
 // Store хранит настройки поиска и записывает результаты в PostgreSQL.
 type Store struct {
-	Pool        *pgxpool.Pool
-	MaxHits     int
-	MaxPostings int
-	Match       matching.Config
+	AlgorithmVersion string
+	Pool             *pgxpool.Pool
+	MaxHits          int
+	MaxPostings      int
+	Match            matching.Config
 }
 
 // Migrate создаёт таблицы под блокировкой, общей для всех запусков утилиты.
@@ -78,58 +79,18 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 	if e = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); e != nil {
 		return r, e
 	}
-	r = domain.Result{SchemaVersion: 1, File: t.File, TaskID: t.TaskID, TrackID: t.TaskID, ScopeID: t.ScopeID, Status: "insufficient_audio", AlgorithmVersion: fingerprint.Version, IndexedAt: now}
-	hashes := make([]int64, len(prints))
-	frames := make([]int32, len(prints))
-	for i, p := range prints {
-		hashes[i] = p.Hash
-		frames[i] = int32(p.Frame)
-	}
+	r = domain.Result{SchemaVersion: 1, File: t.File, TaskID: t.TaskID, TrackID: t.TaskID, ScopeID: t.ScopeID, Status: "insufficient_audio", AlgorithmVersion: s.AlgorithmVersion, IndexedAt: now}
 	if len(prints) > 0 {
-		r.Status = "unique"
-		// Перекрывающиеся окна ограничивают объём поиска за один запрос
-		// и позволяют проверять совпадения на стыках. В индекс попадает весь файл.
-		ordered := append([]domain.Print(nil), prints...)
-		sort.Slice(ordered, func(i, j int) bool { return ordered[i].Frame < ordered[j].Frame })
-		width := int(math.Ceil(math.Max(10, 2*s.Match.MinDuration+s.Match.MaxGap) / fingerprint.FrameSeconds))
-		overlap := int(math.Ceil((s.Match.MinDuration + s.Match.MaxGap) / fingerprint.FrameSeconds))
-		for start := 0; start < len(ordered); {
-			end := sort.Search(len(ordered), func(i int) bool { return ordered[i].Frame >= ordered[start].Frame+width })
-			batch := ordered[start:end]
-			bh, bf := make([]int64, len(batch)), make([]int32, len(batch))
-			for i, p := range batch {
-				bh[i], bf[i] = p.Hash, int32(p.Frame)
-			}
-			hits, err := s.candidates(ctx, tx, t, bh, bf, now)
-			minWidth := int(math.Ceil((2*s.Match.MinDuration + s.Match.MaxGap) / fingerprint.FrameSeconds))
-			if errors.Is(err, ErrCandidateLimit) && width > minWidth {
-				width = max(minWidth, width/2)
-				continue // Повторяем поиск с той же позиции и меньшим окном.
-			}
-			if err != nil {
-				return r, err
-			}
-			candidate, err := matching.BestContext(ctx, hits, s.Match)
-			if err != nil {
-				return r, err
-			}
-			if candidate != nil && (r.Match == nil || candidate.Evidence > r.Match.Evidence) {
-				r.Match = candidate
-			}
-			if end == len(ordered) {
-				break
-			}
-			next := sort.Search(len(ordered), func(i int) bool { return ordered[i].Frame >= ordered[start].Frame+width-overlap })
-			if next <= start {
-				next = end
-			}
-			start = next
+		r.Match, e = s.findMatch(ctx, tx, t, prints, now)
+		if e != nil {
+			return r, e
 		}
-		if r.Match != nil {
-			r.Status = "duplicate"
-		}
-		if !informative(prints, s.Match) {
-			r.Status = "insufficient_audio"
+		if informative(prints, s.Match) {
+			r.Status = "unique"
+			if r.Match != nil {
+				r.Status = "duplicate"
+			}
+		} else {
 			r.Match = nil
 		}
 	}
@@ -140,23 +101,79 @@ func (s *Store) Decide(ctx context.Context, t domain.Task, prints []domain.Print
 			return r, e
 		}
 	}
-	raw, e = json.Marshal(r)
-	if e != nil {
+	if e = s.saveResult(ctx, tx, t, r, prints, now); e != nil {
 		return r, e
 	}
+	return r, tx.Commit(ctx)
+}
+
+func (s *Store) findMatch(ctx context.Context, tx pgx.Tx, t domain.Task, prints []domain.Print, now time.Time) (*domain.Match, error) {
+	var best *domain.Match
+	// Перекрывающиеся окна ограничивают объём поиска за один запрос
+	// и позволяют проверять совпадения на стыках. В индекс попадает весь файл.
+	ordered := append([]domain.Print(nil), prints...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Frame < ordered[j].Frame })
+	width := int(math.Ceil(math.Max(10, 2*s.Match.MinDuration+s.Match.MaxGap) / fingerprint.FrameSeconds))
+	overlap := int(math.Ceil((s.Match.MinDuration + s.Match.MaxGap) / fingerprint.FrameSeconds))
+	for start := 0; start < len(ordered); {
+		end := sort.Search(len(ordered), func(i int) bool { return ordered[i].Frame >= ordered[start].Frame+width })
+		batch := ordered[start:end]
+		bh, bf := make([]int64, len(batch)), make([]int32, len(batch))
+		for i, p := range batch {
+			bh[i], bf[i] = p.Hash, int32(p.Frame)
+		}
+		hits, err := s.candidates(ctx, tx, t, bh, bf, now)
+		minWidth := int(math.Ceil((2*s.Match.MinDuration + s.Match.MaxGap) / fingerprint.FrameSeconds))
+		if errors.Is(err, ErrCandidateLimit) && width > minWidth {
+			width = max(minWidth, width/2)
+			continue // Повторяем поиск с той же позиции и меньшим окном.
+		}
+		if err != nil {
+			return nil, err
+		}
+		candidate, err := matching.BestContext(ctx, hits, s.Match)
+		if err != nil {
+			return nil, err
+		}
+		if candidate != nil && (best == nil || candidate.Evidence > best.Evidence) {
+			best = candidate
+		}
+		if end == len(ordered) {
+			break
+		}
+		next := sort.Search(len(ordered), func(i int) bool { return ordered[i].Frame >= ordered[start].Frame+width-overlap })
+		if next <= start {
+			next = end
+		}
+		start = next
+	}
+	return best, nil
+}
+
+func (s *Store) saveResult(ctx context.Context, tx pgx.Tx, t domain.Task, r domain.Result, prints []domain.Print, now time.Time) error {
+	raw, e := json.Marshal(r)
+	if e != nil {
+		return e
+	}
 	if _, e = tx.Exec(ctx, "INSERT INTO rd_tasks(scope_id,task_id,digest,result,created_at) VALUES($1,$2,$3,$4,$5)", t.ScopeID, t.TaskID, t.TaskID, raw, now); e != nil {
-		return r, e
+		return e
 	}
 	// Индексируем и частичные повторы, чтобы новые фрагменты участвовали в следующих поисках.
 	if r.Status != "insufficient_audio" {
+		hashes := make([]int64, len(prints))
+		frames := make([]int32, len(prints))
+		for i, p := range prints {
+			hashes[i] = p.Hash
+			frames[i] = int32(p.Frame)
+		}
 		_, e = tx.Exec(ctx, `INSERT INTO rd_prints(scope_id,task_id,track_id,version,hash,frame,created_at)
    SELECT $1,$2,$3,$4,x.hash,x.frame,$5 FROM unnest($6::bigint[],$7::integer[]) AS x(hash,frame)
-   ON CONFLICT DO NOTHING`, t.ScopeID, t.TaskID, t.TaskID, fingerprint.Version, now, hashes, frames)
+   ON CONFLICT DO NOTHING`, t.ScopeID, t.TaskID, t.TaskID, s.AlgorithmVersion, now, hashes, frames)
 		if e != nil {
-			return r, e
+			return e
 		}
 	}
-	return r, tx.Commit(ctx)
+	return nil
 }
 
 // informative проверяет разнообразие отпечатков и длительность сигнала между ними.
@@ -232,7 +249,7 @@ func (s *Store) candidateSQL(t domain.Task, hashes []int64, frames []int32, now 
        JOIN rd_prints p ON p.hash=q.hash
        WHERE p.scope_id=$3 AND p.version=$4 AND p.created_at <= $5
        ORDER BY p.track_id,q.frame,p.frame LIMIT $6`
-	args := []any{hashes, frames, t.ScopeID, fingerprint.Version, now, s.MaxHits + 1}
+	args := []any{hashes, frames, t.ScopeID, s.AlgorithmVersion, now, s.MaxHits + 1}
 	if s.MaxPostings > 0 {
 		query = `WITH query_prints AS MATERIALIZED (
           SELECT DISTINCT hash,frame FROM unnest($1::bigint[],$2::integer[]) AS q(hash,frame)
